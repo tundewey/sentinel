@@ -1,0 +1,2 @@
+-- Sentinel MVP schema placeholder
+-- TODO: define users, incidents, jobs, and agent_outputs tables.

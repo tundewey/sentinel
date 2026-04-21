@@ -1,0 +1,6 @@
+[project]
+name = "sentinel-intel"
+version = "0.1.0"
+description = "Sentinel App Runner intel service"
+requires-python = ">=3.12"
+dependencies = ["fastapi", "uvicorn", "openai-agents", "litellm", "httpx", "pydantic"]

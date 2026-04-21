@@ -1,0 +1,6 @@
+[project]
+name = "sentinel-ingest"
+version = "0.1.0"
+description = "Sentinel ingest lambda"
+requires-python = ">=3.12"
+dependencies = ["boto3", "pydantic"]

@@ -1,0 +1,11 @@
+[project]
+name = "sentinel-agent"
+version = "0.1.0"
+description = "Sentinel agent module"
+requires-python = ">=3.12"
+dependencies = [
+  "openai-agents",
+  "litellm",
+  "boto3",
+  "pydantic",
+]

@@ -1,0 +1,6 @@
+[project]
+name = "sentinel-terraform-tools"
+version = "0.1.0"
+description = "Helper scripts for Sentinel terraform workflows"
+requires-python = ">=3.12"
+dependencies = []
