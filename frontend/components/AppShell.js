@@ -8,6 +8,7 @@ const clerkEnabled = isClerkEnabled();
 const nav = [
   { href: "/", label: "Analyze" },
   { href: "/dashboard", label: "Dashboard" },
+  { href: "/audit", label: "Audit" },
   { href: "/settings", label: "Settings" },
 ];
 

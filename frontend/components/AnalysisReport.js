@@ -4,6 +4,7 @@ import {
   createFollowUp,
   deleteFollowUp,
   downloadJobExport,
+  evaluateActionFindings,
   fetchActionChatHistory,
   fetchFollowUps,
   fetchRemediationActions,
@@ -508,9 +509,21 @@ function RemindMeModal({ action, jobId, getToken, userProfile, onClose, followUp
 
 // ── Action item (TODO card) ────────────────────────────────────────────────────
 
-function ActionItem({ action, onStatusChange, onNotesSave, onDueDateChange, onChatOpen, onRemindOpen }) {
-  const [notesOpen, setNotesOpen] = useState(false);
-  const [noteDraft, setNoteDraft] = useState(action.notes || "");
+function ActionItem({
+  action,
+  onStatusChange,
+  onDueDateChange,
+  onChatOpen,
+  onRemindOpen,
+  onEvaluate,  // (actionId, findings) => Promise<{ satisfied, response, next_step, child_action_id }>
+  isTrail,     // true when this is a child/trail action
+}) {
+  const [findingsOpen, setFindingsOpen] = useState(false);
+  const [findingsDraft, setFindingsDraft] = useState(action.notes || "");
+  const [submitting, setSubmitting] = useState(false);
+  const [evalResult, setEvalResult] = useState(
+    action.eval_response ? { response: action.eval_response, satisfied: action.status === "done" } : null
+  );
   const [editingDue, setEditingDue] = useState(false);
   const [dueDraft, setDueDraft] = useState(action.due_date || "");
   const isDone = action.status === "done";
@@ -523,9 +536,15 @@ function ActionItem({ action, onStatusChange, onNotesSave, onDueDateChange, onCh
     onStatusChange(action.id, isDone ? "pending" : "done");
   }
 
-  function handleNotesBlur() {
-    if (noteDraft !== (action.notes || "")) {
-      onNotesSave(action.id, noteDraft);
+  async function handleSubmitFindings() {
+    if (!findingsDraft.trim() || !onEvaluate) return;
+    setSubmitting(true);
+    try {
+      const result = await onEvaluate(action.id, findingsDraft.trim());
+      setEvalResult(result);
+      setFindingsOpen(false);
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -539,13 +558,17 @@ function ActionItem({ action, onStatusChange, onNotesSave, onDueDateChange, onCh
   return (
     <li
       style={{
-        background: "var(--surface-2)",
+        background: isDone ? "var(--surface)" : "var(--surface-2)",
         borderRadius: "var(--radius-sm)",
         padding: "10px 12px",
-        opacity: isSkipped ? 0.5 : 1,
+        opacity: isSkipped ? 0.5 : isDone ? 0.7 : 1,
         display: "flex",
         flexDirection: "column",
         gap: 6,
+        borderLeft: isTrail
+          ? `3px solid ${isDone ? "var(--ok)" : "var(--accent)"}`
+          : isDone ? "3px solid var(--ok)" : undefined,
+        marginLeft: isTrail ? 20 : 0,
       }}
     >
       {/* Top row: checkbox + text + severity + status */}
@@ -591,74 +614,102 @@ function ActionItem({ action, onStatusChange, onNotesSave, onDueDateChange, onCh
         {/* Severity badge (AI-assigned, read-only) */}
         <SeverityBadge severity={action.severity || "medium"} />
 
-        {/* Status dropdown */}
-        <select
-          value={action.status}
-          onChange={(e) => onStatusChange(action.id, e.target.value)}
-          title={meta.hint}
-          style={{
-            background: "var(--surface)",
-            border: "1px solid var(--border)",
-            borderRadius: 6,
-            color: meta.color,
-            fontSize: 11,
-            fontWeight: 600,
-            padding: "2px 6px",
-            cursor: "pointer",
-            flexShrink: 0,
-          }}
-        >
-          {Object.entries(STATUS_META).map(([val, m]) => (
-            <option key={val} value={val} title={m.hint}>{m.label}</option>
-          ))}
-        </select>
-      </div>
-
-      {/* Due date row */}
-      <div style={{ paddingLeft: 28, display: "flex", alignItems: "center", gap: 6 }}>
-        {!editingDue ? (
-          <button
-            type="button"
-            onClick={() => setEditingDue(true)}
+        {/* Status dropdown — hidden when done (checkbox is the toggle) */}
+        {!isDone && (
+          <select
+            value={action.status}
+            onChange={(e) => onStatusChange(action.id, e.target.value)}
+            title={meta.hint}
             style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+              borderRadius: 6,
+              color: meta.color,
               fontSize: 11,
-              color: isOverdue ? "var(--error, #dc2626)" : action.due_date ? "var(--warn)" : "var(--muted)",
-              padding: 0,
-              display: "flex",
-              alignItems: "center",
-              gap: 4,
+              fontWeight: 600,
+              padding: "2px 6px",
+              cursor: "pointer",
+              flexShrink: 0,
             }}
           >
-            <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M5 1v2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-2V1h-2v2H7V1H5zm-2 4h10v8H3V5zm4 2v2H5V7h2zm4 0v2H9V7h2z" />
-            </svg>
-            {action.due_date
-              ? `Due ${new Date(action.due_date).toLocaleDateString()}${isOverdue ? " · overdue" : ""}`
-              : "Set due date"}
-          </button>
-        ) : (
-          <input
-            type="date"
-            className="input"
-            value={dueDraft ? dueDraft.slice(0, 10) : ""}
-            onChange={(e) => setDueDraft(e.target.value)}
-            onBlur={handleDueBlur}
-            autoFocus
-            style={{ fontSize: 11, padding: "2px 6px", marginTop: 0, width: "auto" }}
-          />
+            {Object.entries(STATUS_META).map(([val, m]) => (
+              <option key={val} value={val} title={m.hint}>{m.label}</option>
+            ))}
+          </select>
         )}
       </div>
 
-      {/* Notes + optional Chat row */}
-      <div style={{ paddingLeft: 28, display: "flex", alignItems: "flex-start", gap: 8 }}>
-        <div style={{ flex: 1 }}>
-          {!notesOpen && (
+      {/* Due date row — hidden when done */}
+      {!isDone && (
+        <div style={{ paddingLeft: 28, display: "flex", alignItems: "center", gap: 6 }}>
+          {!editingDue ? (
             <button
               type="button"
-              onClick={() => setNotesOpen(true)}
+              onClick={() => setEditingDue(true)}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                fontSize: 11,
+                color: isOverdue ? "var(--error, #dc2626)" : action.due_date ? "var(--warn)" : "var(--muted)",
+                padding: 0,
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+              }}
+            >
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M5 1v2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-2V1h-2v2H7V1H5zm-2 4h10v8H3V5zm4 2v2H5V7h2zm4 0v2H9V7h2z" />
+              </svg>
+              {action.due_date
+                ? `Due ${new Date(action.due_date).toLocaleDateString()}${isOverdue ? " · overdue" : ""}`
+                : "Set due date"}
+            </button>
+          ) : (
+            <input
+              type="date"
+              className="input"
+              value={dueDraft ? dueDraft.slice(0, 10) : ""}
+              onChange={(e) => setDueDraft(e.target.value)}
+              onBlur={handleDueBlur}
+              autoFocus
+              style={{ fontSize: 11, padding: "2px 6px", marginTop: 0, width: "auto" }}
+            />
+          )}
+        </div>
+      )}
+
+      {/* Findings + evaluation row */}
+      <div style={{ paddingLeft: 28, display: "flex", alignItems: "flex-start", gap: 8 }}>
+        <div style={{ flex: 1 }}>
+          {/* LLM eval response bubble (persisted or just received) */}
+          {evalResult && !findingsOpen && (
+            <div
+              style={{
+                marginBottom: 6,
+                padding: "8px 10px",
+                borderRadius: 8,
+                background: evalResult.satisfied
+                  ? "rgba(34,197,94,0.1)"
+                  : "rgba(251,191,36,0.1)",
+                border: `1px solid ${evalResult.satisfied ? "rgba(34,197,94,0.3)" : "rgba(251,191,36,0.3)"}`,
+                fontSize: 12,
+                color: "var(--text)",
+                lineHeight: 1.5,
+              }}
+            >
+              <span style={{ fontWeight: 700, color: evalResult.satisfied ? "var(--ok)" : "var(--warn)", marginRight: 6 }}>
+                {evalResult.satisfied ? "✓ Resolved:" : "⚠ Follow-up needed:"}
+              </span>
+              {evalResult.response}
+            </div>
+          )}
+
+          {/* Show recorded findings as a summary when panel is closed */}
+          {!findingsOpen && !isDone && (
+            <button
+              type="button"
+              onClick={() => setFindingsOpen(true)}
               style={{
                 background: "none",
                 border: "none",
@@ -668,55 +719,40 @@ function ActionItem({ action, onStatusChange, onNotesSave, onDueDateChange, onCh
                 padding: 0,
               }}
             >
-              {action.notes ? `Note: ${action.notes}` : "+ Add note"}
+              {action.notes
+                ? `Findings: ${action.notes.length > 60 ? action.notes.slice(0, 60) + "…" : action.notes}`
+                : "+ Record findings"}
             </button>
           )}
-          {notesOpen && (
-            <div style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+
+          {/* Findings input panel */}
+          {findingsOpen && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               <textarea
                 className="input"
                 rows={2}
                 placeholder="Note why this was done, skipped, or what you found…"
                 value={noteDraft}
                 onChange={(e) => setNoteDraft(e.target.value)}
+                onBlur={handleNotesBlur}
                 style={{ fontSize: 12, resize: "vertical", flex: 1, marginTop: 0 }}
                 autoFocus
               />
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <button
-                  type="button"
-                  onClick={() => { handleNotesBlur(); setNotesOpen(false); }}
-                  className="btn btn-muted"
-                  style={{ fontSize: 11, padding: "3px 8px", flexShrink: 0 }}
-                >
-                  Save
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setNoteDraft(action.notes || "");
-                    setNotesOpen(false);
-                  }}
-                  className="btn btn-muted"
-                  style={{
-                    fontSize: 14,
-                    padding: "0 8px",
-                    flexShrink: 0,
-                    color: "var(--error, #dc2626)",
-                    fontWeight: "bold",
-                  }}
-                  title="Cancel"
-                >
-                  ×
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => { handleNotesBlur(); setNotesOpen(false); }}
+                className="btn btn-muted"
+                style={{ fontSize: 11, padding: "3px 8px", flexShrink: 0 }}
+              >
+                Save
+              </button>
             </div>
           )}
         </div>
 
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-          {/* Remind me button */}
-          {onRemindOpen && (
+          {/* Remind me button — hidden when done */}
+          {onRemindOpen && !isDone && (
             <button
               type="button"
               onClick={() => onRemindOpen(action)}
@@ -743,8 +779,8 @@ function ActionItem({ action, onStatusChange, onNotesSave, onDueDateChange, onCh
             </button>
           )}
 
-          {/* Chat button — only shown for recommended actions */}
-          {onChatOpen && (
+          {/* Chat button — hidden when done */}
+          {onChatOpen && !isDone && (
             <button
               type="button"
               onClick={() => onChatOpen(action)}
@@ -777,6 +813,30 @@ function ActionItem({ action, onStatusChange, onNotesSave, onDueDateChange, onCh
 }
 
 // ── Remediation Checklist ──────────────────────────────────────────────────────
+
+/** Build an ordered flat list: root action followed immediately by its trail children. */
+function buildTrail(actions) {
+  const byParent = {};
+  for (const a of actions) {
+    const p = a.parent_action_id || null;
+    if (!byParent[p]) byParent[p] = [];
+    byParent[p].push(a);
+  }
+  const SORDER = { critical: 0, high: 1, medium: 2, low: 3 };
+  function sort(list) {
+    return [...list].sort((a, b) => (SORDER[a.severity] ?? 2) - (SORDER[b.severity] ?? 2));
+  }
+  const result = [];
+  function walk(parentId, depth) {
+    const children = sort(byParent[parentId] || []);
+    for (const a of children) {
+      result.push({ action: a, depth });
+      walk(a.id, depth + 1);
+    }
+  }
+  walk(null, 0);
+  return result;
+}
 
 function RemediationChecklist({ jobId, getToken, userProfile }) {
   const [actions, setActions] = useState([]);
@@ -816,14 +876,6 @@ function RemediationChecklist({ jobId, getToken, userProfile }) {
     } catch { /* best-effort */ }
   }
 
-  async function saveNotes(actionId, notes) {
-    try {
-      const token = getToken ? await getToken() : null;
-      await updateRemediationAction(jobId, actionId, { notes }, token);
-      setActions((prev) => prev.map((a) => a.id === actionId ? { ...a, notes } : a));
-    } catch { /* best-effort */ }
-  }
-
   async function changeDueDate(actionId, due_date) {
     try {
       const token = getToken ? await getToken() : null;
@@ -832,18 +884,55 @@ function RemediationChecklist({ jobId, getToken, userProfile }) {
     } catch { /* best-effort */ }
   }
 
+  async function handleEvaluate(actionId, findings) {
+    const token = getToken ? await getToken() : null;
+    const result = await evaluateActionFindings(jobId, actionId, findings, token);
+    // resolved_parent_ids is the full ancestor chain already marked done by the backend
+    const resolvedSet = new Set(result.resolved_parent_ids || []);
+
+    setActions((prev) => {
+      const evaluatedAction = prev.find((a) => a.id === actionId);
+      let next = prev.map((a) => {
+        if (a.id === actionId) {
+          return { ...a, notes: findings, eval_response: result.response, status: result.satisfied ? "done" : a.status };
+        }
+        if (resolvedSet.has(a.id)) {
+          return { ...a, status: "done" };
+        }
+        return a;
+      });
+      if (result.child_action_id) {
+        next = [...next, {
+          id: result.child_action_id,
+          job_id: jobId,
+          action_text: result.next_step,
+          action_type: evaluatedAction?.action_type || "recommended",
+          status: "pending",
+          severity: evaluatedAction?.severity || "medium",
+          parent_action_id: actionId,
+          eval_response: null,
+          notes: null,
+          due_date: null,
+        }];
+      }
+      return next;
+    });
+    return result;
+  }
+
   if (!loaded || actions.length === 0) return null;
 
-  const recommended = actions.filter((a) => a.action_type === "recommended");
-  // Sort by severity: critical → high → medium → low
-  const SORDER = { critical: 0, high: 1, medium: 2, low: 3 };
-  recommended.sort((a, b) => (SORDER[a.severity] ?? 2) - (SORDER[b.severity] ?? 2));
+  const recommended = actions.filter(
+    (a) => a.action_type === "recommended" || a.action_type === "trail"
+      || (a.action_type !== "check" && a.action_type !== "followup_check" && a.action_type !== "followup"),
+  );
 
+  const trail = buildTrail(recommended);
   const doneCount = recommended.filter((a) => a.status === "done").length;
   const total = recommended.length;
   const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0;
 
-  if (!recommended.length) return null;
+  if (!trail.length) return null;
 
   return (
     <>
@@ -854,7 +943,8 @@ function RemediationChecklist({ jobId, getToken, userProfile }) {
             <h2 style={{ margin: 0 }}>Remediation TODO</h2>
             <p className="muted small" style={{ margin: "3px 0 0" }}>
               {doneCount} of {total} step{total !== 1 ? "s" : ""} completed — click{" "}
-              <strong style={{ color: "var(--accent)" }}>Chat</strong> on any step for AI-guided instructions
+              <strong style={{ color: "var(--accent)" }}>Chat</strong> on any step or{" "}
+              <strong style={{ color: "var(--accent)" }}>Record findings</strong> for AI evaluation
             </p>
           </div>
           <span
@@ -922,15 +1012,16 @@ function RemediationChecklist({ jobId, getToken, userProfile }) {
         </div>
 
         <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 6 }}>
-          {recommended.map((action) => (
+          {trail.map(({ action, depth }) => (
             <ActionItem
               key={action.id}
               action={action}
               onStatusChange={changeStatus}
-              onNotesSave={saveNotes}
               onDueDateChange={changeDueDate}
               onChatOpen={setChatAction}
               onRemindOpen={setRemindAction}
+              onEvaluate={handleEvaluate}
+              isTrail={depth > 0}
             />
           ))}
         </ul>
@@ -973,7 +1064,7 @@ function ImmediateChecksCard({ jobId, getToken, userProfile }) {
           fetchFollowUps(jobId, token).catch(() => []),
         ]);
         if (!cancel) {
-          setActions(data.filter((a) => a.action_type === "check"));
+          setActions(data.filter((a) => a.action_type === "check" || a.action_type === "followup_check" || (a.action_type === "trail" && data.find((p) => p.id === a.parent_action_id)?.action_type === "check")));
           setFollowUps(fuData);
         }
       } catch {
@@ -993,14 +1084,6 @@ function ImmediateChecksCard({ jobId, getToken, userProfile }) {
     } catch { /* best-effort */ }
   }
 
-  async function saveNotes(actionId, notes) {
-    try {
-      const token = getToken ? await getToken() : null;
-      await updateRemediationAction(jobId, actionId, { notes }, token);
-      setActions((prev) => prev.map((a) => a.id === actionId ? { ...a, notes } : a));
-    } catch { /* best-effort */ }
-  }
-
   async function changeDueDate(actionId, due_date) {
     try {
       const token = getToken ? await getToken() : null;
@@ -1009,25 +1092,64 @@ function ImmediateChecksCard({ jobId, getToken, userProfile }) {
     } catch { /* best-effort */ }
   }
 
+  async function handleEvaluate(actionId, findings) {
+    const token = getToken ? await getToken() : null;
+    const result = await evaluateActionFindings(jobId, actionId, findings, token);
+    const resolvedSet = new Set(result.resolved_parent_ids || []);
+
+    setActions((prev) => {
+      const evaluatedAction = prev.find((a) => a.id === actionId);
+      let next = prev.map((a) => {
+        if (a.id === actionId) {
+          return { ...a, notes: findings, eval_response: result.response, status: result.satisfied ? "done" : a.status };
+        }
+        if (resolvedSet.has(a.id)) {
+          return { ...a, status: "done" };
+        }
+        return a;
+      });
+      if (result.child_action_id) {
+        next = [...next, {
+          id: result.child_action_id,
+          job_id: jobId,
+          action_text: result.next_step,
+          action_type: evaluatedAction?.action_type || "check",
+          status: "pending",
+          severity: evaluatedAction?.severity || "medium",
+          parent_action_id: actionId,
+          eval_response: null,
+          notes: null,
+          due_date: null,
+        }];
+      }
+      return next;
+    });
+    return result;
+  }
+
   if (!loaded || actions.length === 0) return null;
+
+  const trail = buildTrail(actions);
+  if (!trail.length) return null;
 
   return (
     <>
       <article className="card-elevated report-card" id="report-immediate-checks">
         <h2>Immediate Checks</h2>
         <p className="muted small" style={{ margin: "-6px 0 12px" }}>
-          Quick verifications to run now. Mark each as done when confirmed.
+          Quick verifications to run now. Record findings for AI evaluation — resolved checks are auto-closed.
         </p>
         <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 6 }}>
-          {actions.map((action) => (
+          {trail.map(({ action, depth }) => (
             <ActionItem
               key={action.id}
               action={action}
               onStatusChange={changeStatus}
-              onNotesSave={saveNotes}
               onDueDateChange={changeDueDate}
               onChatOpen={null}
               onRemindOpen={setRemindAction}
+              onEvaluate={handleEvaluate}
+              isTrail={depth > 0}
             />
           ))}
         </ul>
@@ -1097,12 +1219,12 @@ export default function AnalysisReport({
                 Export
               </h2>
               <p className="muted small" style={{ margin: "4px 0 0" }}>
-                Log stats and any partial analysis. JSON is always available; PDF follows the same payload.
+                JSON includes the full saved workflow (pipeline, remediation, PIR) when you have run analysis; PDF is a printable summary.
               </p>
             </div>
             <div className="row gap wrap-actions">
               <button type="button" className="btn btn-secondary" onClick={() => exportAs("json")}>
-                Download JSON
+                Download workflow JSON
               </button>
               <button type="button" className="btn" onClick={() => exportAs("pdf")}>
                 Download PDF
@@ -1131,12 +1253,12 @@ export default function AnalysisReport({
               Export
             </h2>
             <p className="muted small" style={{ margin: "4px 0 0" }}>
-              Structured JSON for integrations; PDF for tickets and handoffs.
+              Full workflow JSON for audit and review; PDF for tickets and handoffs.
             </p>
           </div>
           <div className="row gap wrap-actions">
             <button type="button" className="btn btn-secondary" onClick={() => exportAs("json")}>
-              Download JSON
+              Download workflow JSON
             </button>
             <button type="button" className="btn" onClick={() => exportAs("pdf")}>
               Download PDF

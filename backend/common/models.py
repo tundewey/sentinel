@@ -165,3 +165,55 @@ class IntegrationCreate(BaseModel):
 
 class DigestRequest(BaseModel):
     days: int = 7
+
+
+class RemediationFollowUpRequest(BaseModel):
+    """Engineer-provided findings from working through remediation steps."""
+
+    additional_context: str = Field(min_length=1, max_length=10000)
+    anchor_action_id: str | None = None   # action that originated the findings
+
+
+class ActionEvaluationRequest(BaseModel):
+    """Engineer findings submitted against a specific remediation action."""
+
+    findings: str = Field(min_length=1, max_length=10000)
+
+
+class ActionEvaluationResult(BaseModel):
+    """LLM verdict on whether engineer findings resolve a remediation action."""
+
+    satisfied: bool
+    response: str          # short explanation to show the engineer
+    next_step: str | None = None  # sub-action text when not yet satisfied
+
+
+class RemediationFollowUp(BaseModel):
+    """Follow-up actions generated from engineer findings during active remediation."""
+
+    followup_actions: list[str] = Field(default_factory=list)
+    followup_severities: list[str] = Field(default_factory=list)
+    followup_checks: list[str] = Field(default_factory=list)
+    check_severities: list[str] = Field(default_factory=list)
+    updated_risk: str = ""
+    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PostIncidentReview(BaseModel):
+    """Structured post-incident review generated after remediation is complete."""
+
+    job_id: str
+    timeline: str
+    what_went_wrong: str
+    what_went_right: str
+    action_summary: list[str] = Field(default_factory=list)
+    prevention_steps: list[str] = Field(default_factory=list)
+    lessons_learned: str
+    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class IncidentResolveRequest(BaseModel):
+    """Payload to mark an incident resolved."""
+
+    resolution_notes: str | None = None
+    status: Literal["open", "in_progress", "resolved"] = "resolved"
