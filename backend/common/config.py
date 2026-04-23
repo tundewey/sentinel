@@ -19,7 +19,7 @@ def use_bedrock() -> bool:
 
 
 def bedrock_region() -> str:
-    return os.getenv("BEDROCK_REGION", os.getenv("DEFAULT_AWS_REGION", "us-east-1"))
+    return os.getenv("BEDROCK_REGION", os.getenv("DEFAULT_AWS_REGION", "eu-west-1"))
 
 
 def model_support() -> str:
@@ -27,8 +27,8 @@ def model_support() -> str:
 
 
 def model_root_cause() -> str:
-    return os.getenv("BEDROCK_MODEL_ROOT_CAUSE", "us.amazon.nova-pro-v1:0")
+    return os.getenv("BEDROCK_MODEL_ROOT_CAUSE", "eu.amazon.nova-pro-v1:0")
 
 
 def model_remediation() -> str:
-    return os.getenv("BEDROCK_MODEL_REMEDIATION", "us.amazon.nova-pro-v1:0")
+    return os.getenv("BEDROCK_MODEL_REMEDIATION", "eu.amazon.nova-pro-v1:0")
