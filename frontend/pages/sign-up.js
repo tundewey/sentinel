@@ -1,13 +1,13 @@
-import { SignIn } from "@clerk/nextjs";
-import { isClerkEnabled } from "../../lib/clerk";
+import { SignUp } from "@clerk/nextjs";
+import { isClerkEnabled } from "../lib/clerk";
 
-export default function Page() {
+export default function SignUpPage() {
   if (!isClerkEnabled()) {
     return (
       <main className="container stack gap">
         <div className="card">
           <h2>Clerk Not Configured</h2>
-          <p>Add real Clerk keys in `frontend/.env.local` to enable sign-in.</p>
+          <p>Add real Clerk keys in `frontend/.env.local` to enable sign-up.</p>
         </div>
       </main>
     );
@@ -16,7 +16,7 @@ export default function Page() {
   return (
     <main className="container stack gap">
       <div className="card">
-        <SignIn routing="hash" signUpUrl="/sign-up" afterSignInUrl="/" />
+        <SignUp routing="hash" signInUrl="/sign-in" afterSignUpUrl="/" />
       </div>
     </main>
   );
