@@ -24,18 +24,22 @@ from common.config import get_db_path
 from common.log_stats import compute_log_stats
 from common.models import (
     ActionChatRequest,
+    ActionEvaluationRequest,
     ActionUpdate,
     ClarificationAnswers,
     DigestRequest,
     FollowUpCreate,
     GuardrailReport,
     IncidentInput,
+    IncidentResolveRequest,
     IncidentSummary,
     IntegrationCreate,
     InvestigationStreamInput,
     JobCreateResponse,
     NormalizedIncident,
+    RemediationFollowUpRequest,
 )
+from common.audit_pdf import render_audit_classic_pdf
 from common.pdf_report import render_job_pdf
 from common.pipeline import create_incident_and_job, parse_analysis, run_job
 from common.scheduler import ReminderScheduler
@@ -114,18 +118,164 @@ def _enrich_job_view(
     return view
 
 
-def _export_structured(view: dict[str, Any]) -> dict[str, Any]:
+def _incident_export_block(inc: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Snapshot of the incident record for workflow / audit export."""
+    if not inc:
+        return None
+    out: dict[str, Any] = {
+        "id": inc.get("id"),
+        "clerk_user_id": inc.get("clerk_user_id"),
+        "title": inc.get("title"),
+        "source": inc.get("source"),
+        "status": inc.get("status"),
+        "assigned_to": inc.get("assigned_to"),
+        "created_at": inc.get("created_at"),
+        "resolved_at": inc.get("resolved_at"),
+        "resolution_notes": inc.get("resolution_notes"),
+        "raw_text": inc.get("raw_text"),
+        "sanitized_text": inc.get("sanitized_text"),
+    }
+    g = inc.get("guardrail_json")
+    if g:
+        try:
+            out["guardrails"] = json.loads(g) if isinstance(g, str) else g
+        except json.JSONDecodeError:
+            out["guardrails"] = g
+    return out
+
+
+def _remediation_chat_by_action(
+    messages: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    by_action: dict[str, list[dict[str, Any]]] = {}
+    for m in messages:
+        aid = m.get("action_id") or ""
+        by_action.setdefault(aid, []).append(
+            {
+                "id": m.get("id"),
+                "role": m.get("role"),
+                "content": m.get("content"),
+                "created_at": m.get("created_at"),
+            }
+        )
+    return by_action
+
+
+def _clarification_qa_for_export(
+    job_id: str, view: dict[str, Any], db: Database
+) -> list[dict[str, Any]] | None:
+    """Pair stored answers with the same question text the UI showed (rebuilt heuristically)."""
+    answers = db.get_clarification_answers(job_id)
+    if not answers:
+        return None
     analysis = view.get("analysis") or {}
+    rc_data = analysis.get("root_cause")
+    if not rc_data:
+        return [
+            {
+                "question_id": qid,
+                "question": None,
+                "rationale": None,
+                "kind": None,
+                "answer": ans,
+            }
+            for qid, ans in answers.items()
+        ]
+
+    from common.models import RootCauseAnalysis
+    from remediator.agent import build_clarification_set
+
+    try:
+        root_cause = RootCauseAnalysis.model_validate(rc_data)
+    except Exception:  # noqa: BLE001
+        return [
+            {
+                "question_id": qid,
+                "question": None,
+                "rationale": None,
+                "kind": None,
+                "answer": ans,
+            }
+            for qid, ans in answers.items()
+        ]
+
+    evidence = (analysis.get("remediation") or {}).get("recommended_actions") or []
+    cset = build_clarification_set(
+        job_id=job_id,
+        root_cause=root_cause,
+        evidence=evidence,
+        already_answered=True,
+    )
+    q_by_id = {q.id: q for q in cset.questions}
+    out: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for q in cset.questions:
+        if q.id not in answers:
+            continue
+        used.add(q.id)
+        out.append(
+            {
+                "question_id": q.id,
+                "question": q.question,
+                "rationale": q.rationale,
+                "kind": q.kind,
+                "answer": answers[q.id],
+            }
+        )
+    for qid, ans in answers.items():
+        if qid in used:
+            continue
+        q = q_by_id.get(qid)
+        out.append(
+            {
+                "question_id": qid,
+                "question": q.question if q else None,
+                "rationale": q.rationale if q else None,
+                "kind": q.kind if q else None,
+                "answer": ans,
+            }
+        )
+    return out
+
+
+def _build_workflow_export(
+    job_row: dict[str, Any],
+    view: dict[str, Any],
+    db: Database,
+    job_id: str,
+    clerk_user_id: str,
+) -> dict[str, Any]:
+    """Full readonly snapshot: analysis pipeline, remediation, follow-ups, chat, PIR, incident context."""
+
+    inc = db.get_incident(str(view.get("incident_id")), clerk_user_id=clerk_user_id)
+    clar_qa = _clarification_qa_for_export(job_id, view, db)
     return {
-        "export_version": 1,
+        "export_version": 2,
+        "kind": "sentinel_workflow",
         "exported_at": datetime.now(timezone.utc).isoformat(),
-        "incident_id": view.get("incident_id"),
-        "status": view.get("status"),
-        "error": view.get("error"),
-        "remediation": analysis.get("remediation"),
-        "guardrails": analysis.get("guardrails"),
-        "models": analysis.get("models"),
+        "job": {
+            "job_id": view.get("job_id") or job_row.get("id"),
+            "incident_id": view.get("incident_id"),
+            "status": view.get("status"),
+            "error": view.get("error"),
+            "current_stage": view.get("current_stage"),
+            "created_at": job_row.get("created_at"),
+            "completed_at": job_row.get("completed_at"),
+        },
+        "pipeline_events": view.get("pipeline_events") or [],
+        "similar_incidents": view.get("similar_incidents") or [],
+        "analysis": view.get("analysis"),
+        "normalized_text": view.get("normalized_text"),
         "log_stats": view.get("log_stats"),
+        "clarification_answers": db.get_clarification_answers(job_id),
+        "clarification_qa": clar_qa,
+        "remediation_actions": db.list_remediation_actions(job_id),
+        "follow_ups": db.list_follow_ups(job_id),
+        "remediation_chat": _remediation_chat_by_action(
+            db.list_chat_messages_for_job(job_id)
+        ),
+        "post_incident_review": db.get_pir(job_id),
+        "incident": _incident_export_block(inc),
     }
 
 
@@ -306,6 +456,46 @@ def get_job(job_id: str, user: AuthContext = Depends(require_auth)) -> dict[str,
         db.close()
 
 
+@app.get("/api/jobs/{job_id}/workflow")
+def get_workflow_snapshot(
+    job_id: str, user: AuthContext = Depends(require_auth)
+) -> dict[str, Any]:
+    """Readonly full workflow: analysis stages, remediation actions, follow-ups, chat, PIR, incident context."""
+
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        view = _enrich_job_view(row, db, user.user_id)
+        return _build_workflow_export(row, view, db, job_id, user.user_id)
+    finally:
+        db.close()
+
+
+@app.get("/api/jobs/{job_id}/audit/pdf")
+def get_audit_pdf(
+    job_id: str, user: AuthContext = Depends(require_auth)
+) -> Any:
+    """Download full workflow as a traditional (Classic) black-on-white audit PDF."""
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        view = _enrich_job_view(row, db, user.user_id)
+        wf = _build_workflow_export(row, view, db, job_id, user.user_id)
+        pdf = render_audit_classic_pdf(wf)
+        name = f"sentinel-audit-{str(job_id)[:8]}.pdf"
+        return Response(
+            content=bytes(pdf),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+    finally:
+        db.close()
+
+
 @app.get("/api/jobs/{job_id}/export")
 def export_job(
     job_id: str,
@@ -314,7 +504,7 @@ def export_job(
     ),
     user: AuthContext = Depends(require_auth),
 ) -> Any:
-    """Download analysis + log stats as JSON or a printable PDF."""
+    """Download full workflow JSON (audit) or a printable PDF summary."""
     db = _db()
     try:
         row = db.get_job(job_id, clerk_user_id=user.user_id)
@@ -322,8 +512,8 @@ def export_job(
             raise HTTPException(status_code=404, detail="Job not found")
         view = _enrich_job_view(row, db, user.user_id)
         if export_format == "json":
-            body = _export_structured(view)
-            name = f"sentinel-export-{str(job_id)[:8]}.json"
+            body = _build_workflow_export(row, view, db, job_id, user.user_id)
+            name = f"sentinel-workflow-{str(job_id)[:8]}.json"
             return JSONResponse(
                 content=body,
                 headers={"Content-Disposition": f'attachment; filename="{name}"'},
@@ -939,6 +1129,266 @@ def ingest_generic_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     return _ingest_webhook_payload(
         payload, source_label="webhook", user_id="webhook_generic"
     )
+
+
+# ── Action findings evaluation ────────────────────────────────────────────────
+
+
+@app.post("/api/jobs/{job_id}/actions/{action_id}/evaluate", status_code=201)
+def evaluate_action_findings(
+    job_id: str,
+    action_id: str,
+    body: ActionEvaluationRequest,
+    user: AuthContext = Depends(require_auth),
+) -> dict[str, Any]:
+    """Evaluate engineer findings against a remediation action.
+
+    - Persists findings to the action's notes field.
+    - If the LLM is satisfied: marks the action done.
+    - If not satisfied: creates a child trail action with the LLM's next_step text.
+    Returns the evaluation result plus the child action id when created.
+    """
+    from common.models import IncidentAnalysis
+    from remediator.agent import evaluate_findings
+
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        action = db.get_action(action_id)
+        if not action or action.get("job_id") != job_id:
+            raise HTTPException(status_code=404, detail="Action not found")
+
+        view = _job_view(row)
+        analysis_data = view.get("analysis")
+        if not analysis_data:
+            raise HTTPException(status_code=422, detail="Job has no completed analysis")
+
+        analysis = IncidentAnalysis.model_validate(analysis_data)
+
+        # Persist the findings as the action's notes
+        db.update_remediation_action(action_id, notes=body.findings)
+
+        verdict = evaluate_findings(action["action_text"], analysis, body.findings)
+
+        # Persist the LLM response on the action
+        db.save_action_eval_response(action_id, verdict.response)
+
+        child_action_id: str | None = None
+        resolved_parent_ids: list[str] = []
+
+        if verdict.satisfied:
+            db.update_remediation_action(action_id, status="done")
+            # Walk up the ancestor chain and mark every parent done too
+            cursor_id = action.get("parent_action_id")
+            while cursor_id:
+                db.update_remediation_action(cursor_id, status="done")
+                resolved_parent_ids.append(cursor_id)
+                parent_row = db.get_action(cursor_id)
+                cursor_id = parent_row.get("parent_action_id") if parent_row else None
+        elif verdict.next_step:
+            child_action_id = db.seed_trail_action(
+                job_id=job_id,
+                action_text=verdict.next_step,
+                severity=action.get("severity", "medium"),
+                action_type=action.get("action_type", "recommended"),
+                parent_action_id=action_id,
+            )
+
+        return {
+            "satisfied": verdict.satisfied,
+            "response": verdict.response,
+            "next_step": verdict.next_step,
+            "child_action_id": child_action_id,
+            "action_id": action_id,
+            "resolved_parent_ids": resolved_parent_ids,
+        }
+    finally:
+        db.close()
+
+
+# ── Remediation follow-up ─────────────────────────────────────────────────────
+
+
+@app.post("/api/jobs/{job_id}/remediation-followup", status_code=201)
+def remediation_followup(
+    job_id: str,
+    body: RemediationFollowUpRequest,
+    user: AuthContext = Depends(require_auth),
+) -> dict[str, Any]:
+    """Accept engineer findings from active remediation and generate follow-up actions.
+
+    The additional_context field captures what the engineer discovered while working
+    through the initial plan (e.g. a rollback uncovered a deeper config issue).
+    Follow-up actions are appended to the existing action list — the original plan
+    is never replaced.
+    """
+    from common.models import IncidentAnalysis
+    from remediator.agent import generate_followup_actions
+
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if row.get("status") != "completed":
+            raise HTTPException(
+                status_code=422, detail="Follow-up requires a completed analysis"
+            )
+
+        view = _job_view(row)
+        analysis_data = view.get("analysis")
+        if not analysis_data:
+            raise HTTPException(status_code=422, detail="Job has no completed analysis")
+
+        analysis = IncidentAnalysis.model_validate(analysis_data)
+        current_actions = db.list_remediation_actions(job_id)
+
+        followup = generate_followup_actions(
+            analysis,
+            current_actions,
+            body.additional_context,
+            anchor_action_id=body.anchor_action_id,
+        )
+
+        incident_severity = analysis.summary.severity
+        _lower = {"critical": "high", "high": "medium", "medium": "low", "low": "low"}
+        fallback_check_sev = _lower.get(incident_severity, "medium")
+        valid_severities = {"critical", "high", "medium", "low"}
+
+        seeded: list[str] = []
+
+        anchor = body.anchor_action_id
+        submission = body.additional_context
+
+        if followup.followup_actions:
+            sevs = list(followup.followup_severities)
+            while len(sevs) < len(followup.followup_actions):
+                sevs.append(incident_severity)
+            for text, sev in zip(followup.followup_actions, sevs):
+                sev = sev if sev in valid_severities else incident_severity
+                db.seed_remediation_actions(
+                    job_id,
+                    [text],
+                    action_type="followup",
+                    severity=sev,
+                    engineer_submission=submission,
+                    source_anchor_action_id=anchor,
+                )
+                seeded.append(text)
+
+        if followup.followup_checks:
+            sevs = list(followup.check_severities)
+            while len(sevs) < len(followup.followup_checks):
+                sevs.append(fallback_check_sev)
+            for text, sev in zip(followup.followup_checks, sevs):
+                sev = sev if sev in valid_severities else fallback_check_sev
+                db.seed_remediation_actions(
+                    job_id,
+                    [text],
+                    action_type="followup_check",
+                    severity=sev,
+                    engineer_submission=submission,
+                    source_anchor_action_id=anchor,
+                )
+                seeded.append(text)
+
+        return {
+            "generated": True,
+            "new_actions_count": len(seeded),
+            "followup": followup.model_dump(),
+        }
+    finally:
+        db.close()
+
+
+# ── Incident resolution ───────────────────────────────────────────────────────
+
+
+@app.patch("/api/incidents/{incident_id}/status")
+def update_incident_status_endpoint(
+    incident_id: str,
+    body: IncidentResolveRequest,
+    user: AuthContext = Depends(require_auth),
+) -> dict[str, Any]:
+    """Mark an incident open / in_progress / resolved with optional notes."""
+    valid_statuses = {"open", "in_progress", "resolved"}
+    if body.status not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status must be one of {sorted(valid_statuses)}",
+        )
+    db = _db()
+    try:
+        ok = db.update_incident_resolution(
+            incident_id,
+            status=body.status,
+            resolution_notes=body.resolution_notes,
+            clerk_user_id=user.user_id,
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        return {"incident_id": incident_id, "status": body.status, "updated": True}
+    finally:
+        db.close()
+
+
+# ── Post-Incident Review ───────────────────────────────────────────────────────
+
+
+@app.get("/api/jobs/{job_id}/pir")
+def get_pir(job_id: str, user: AuthContext = Depends(require_auth)) -> dict[str, Any]:
+    """Return a previously generated post-incident review, or 404 if none exists."""
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        pir = db.get_pir(job_id)
+        if not pir:
+            raise HTTPException(status_code=404, detail="No PIR generated yet")
+        return pir
+    finally:
+        db.close()
+
+
+@app.post("/api/jobs/{job_id}/pir", status_code=201)
+def generate_pir_endpoint(
+    job_id: str,
+    user: AuthContext = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate and persist a post-incident review for a completed job.
+
+    Re-generates a fresh PIR if one already exists (allows regeneration after
+    more actions are marked done).
+    """
+    from common.models import IncidentAnalysis
+    from remediator.agent import generate_pir
+
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if row.get("status") != "completed":
+            raise HTTPException(
+                status_code=422, detail="PIR can only be generated for completed jobs"
+            )
+        view = _job_view(row)
+        analysis_data = view.get("analysis")
+        if not analysis_data:
+            raise HTTPException(status_code=422, detail="Job has no completed analysis")
+
+        analysis = IncidentAnalysis.model_validate(analysis_data)
+        actions = db.list_remediation_actions(job_id)
+
+        pir = generate_pir(analysis, actions)
+        db.save_pir(job_id, pir.model_dump_json())
+        return pir.model_dump()
+    finally:
+        db.close()
 
 
 # ── Digest reports ────────────────────────────────────────────────────────────

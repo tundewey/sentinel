@@ -35,7 +35,7 @@ def _openrouter_headers() -> dict[str, str]:
 
 
 def _converse_json_openrouter(
-    system_prompt: str, user_prompt: str
+    system_prompt: str, user_prompt: str, max_tokens: int = 1500
 ) -> dict[str, Any] | None:
     """Call OpenRouter chat completions and parse the JSON response."""
     payload = {
@@ -45,7 +45,7 @@ def _converse_json_openrouter(
             {"role": "user", "content": user_prompt},
         ],
         "response_format": {"type": "json_object"},
-        "max_tokens": 700,
+        "max_tokens": max_tokens,
         "temperature": 0.1,
     }
     try:
@@ -110,7 +110,7 @@ def _converse_stream_text_openrouter(
 
 
 def _converse_json_bedrock(
-    model_id: str, system_prompt: str, user_prompt: str
+    model_id: str, system_prompt: str, user_prompt: str, max_tokens: int = 1500
 ) -> dict[str, Any] | None:
     try:
         client = boto3.client("bedrock-runtime", region_name=bedrock_region())
@@ -118,7 +118,7 @@ def _converse_json_bedrock(
             modelId=model_id,
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_prompt}]}],
-            inferenceConfig={"maxTokens": 700, "temperature": 0.1},
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.1},
         )
         content = response["output"]["message"]["content"][0].get("text", "{}").strip()
         return json.loads(content)
@@ -229,7 +229,7 @@ def _converse_stream_chat_bedrock(
 
 
 def converse_json(
-    model_id: str, system_prompt: str, user_prompt: str
+    model_id: str, system_prompt: str, user_prompt: str, max_tokens: int = 1500
 ) -> dict[str, Any] | None:
     """Best-effort LLM call that expects JSON output.
 
@@ -238,9 +238,9 @@ def converse_json(
     Returns ``None`` when neither is configured or if invocation fails.
     """
     if use_openrouter():
-        return _converse_json_openrouter(system_prompt, user_prompt)
+        return _converse_json_openrouter(system_prompt, user_prompt, max_tokens=max_tokens)
     if use_bedrock():
-        return _converse_json_bedrock(model_id, system_prompt, user_prompt)
+        return _converse_json_bedrock(model_id, system_prompt, user_prompt, max_tokens=max_tokens)
     return None
 
 
