@@ -732,20 +732,33 @@ function ActionItem({
                 className="input"
                 rows={2}
                 placeholder="Note why this was done, skipped, or what you found…"
-                value={noteDraft}
-                onChange={(e) => setNoteDraft(e.target.value)}
-                onBlur={handleNotesBlur}
+                value={findingsDraft}
+                onChange={(e) => setFindingsDraft(e.target.value)}
                 style={{ fontSize: 12, resize: "vertical", flex: 1, marginTop: 0 }}
                 autoFocus
               />
-              <button
-                type="button"
-                onClick={() => { handleNotesBlur(); setNotesOpen(false); }}
-                className="btn btn-muted"
-                style={{ fontSize: 11, padding: "3px 8px", flexShrink: 0 }}
-              >
-                Save
-              </button>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <button
+                  type="button"
+                  onClick={handleSubmitFindings}
+                  disabled={submitting || !findingsDraft.trim() || !onEvaluate}
+                  className="btn btn-muted"
+                  style={{ fontSize: 11, padding: "3px 8px", flexShrink: 0 }}
+                >
+                  {submitting ? "Evaluating…" : "Submit findings"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFindingsDraft(action.notes || "");
+                    setFindingsOpen(false);
+                  }}
+                  className="btn btn-muted"
+                  style={{ fontSize: 11, padding: "3px 8px" }}
+                >
+                  Cancel
+                </button>
+              </div>
             </div>
           )}
         </div>
