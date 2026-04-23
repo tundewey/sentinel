@@ -107,6 +107,47 @@ export async function fetchJob(jobId, token) {
   return request(`/api/jobs/${jobId}`, { token });
 }
 
+/** GET /api/jobs/{id}/workflow — full readonly workflow snapshot (audit / review in UI). */
+export async function fetchJobWorkflow(jobId, token) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/workflow`, { token });
+}
+
+/**
+ * Download GET /api/jobs/{id}/audit/pdf — Classic (traditional) audit report as PDF.
+ */
+export async function downloadAuditPdf(jobId, token) {
+  const enc = encodeURIComponent(jobId);
+  const headers = { Accept: "application/pdf" };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const res = await fetch(`${BASE_URL}/api/jobs/${enc}/audit/pdf`, { headers });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Audit PDF export failed: ${res.status}`);
+  }
+  const buf = await res.arrayBuffer();
+  const head = new Uint8Array(buf.slice(0, 5));
+  const sig = String.fromCharCode(...head.slice(0, 4));
+  if (sig !== "%PDF") {
+    const text = new TextDecoder().decode(buf);
+    throw new Error(text || "Server did not return a valid PDF.");
+  }
+  const blob = new Blob([buf], { type: "application/pdf" });
+  const name = `sentinel-audit-${String(jobId).slice(0, 8)}.pdf`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 0);
+}
+
 export async function fetchJobs(limit = 25, token) {
   return request(`/api/jobs?limit=${encodeURIComponent(String(limit))}`, { token });
 }
@@ -145,7 +186,7 @@ export async function downloadJobExport(jobId, format, token) {
   const mime = fmt === "pdf" ? "application/pdf" : "application/json";
   const blob = new Blob([buf], { type: mime });
   const ext = fmt === "pdf" ? "pdf" : "json";
-  const name = `sentinel-export-${String(jobId).slice(0, 8)}.${ext}`;
+  const name = `${fmt === "json" ? "sentinel-workflow" : "sentinel-export"}-${String(jobId).slice(0, 8)}.${ext}`;
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -307,6 +348,46 @@ export async function streamActionChat(jobId, actionId, message, history, token,
       }
     }
   }
+}
+
+// ── Action findings evaluation ────────────────────────────────────────────────
+
+export async function evaluateActionFindings(jobId, actionId, findings, token) {
+  return request(
+    `/api/jobs/${encodeURIComponent(jobId)}/actions/${encodeURIComponent(actionId)}/evaluate`,
+    { method: "POST", body: JSON.stringify({ findings }), token },
+  );
+}
+
+// ── Remediation follow-up ─────────────────────────────────────────────────────
+
+export async function submitRemediationFollowup(jobId, additional_context, token, anchor_action_id = null) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/remediation-followup`, {
+    method: "POST",
+    body: JSON.stringify({ additional_context, ...(anchor_action_id ? { anchor_action_id } : {}) }),
+    token,
+  });
+}
+
+// ── Incident resolution & Post-Incident Review ────────────────────────────────
+
+export async function resolveIncident(incidentId, { status = "resolved", resolution_notes = "" } = {}, token) {
+  return request(`/api/incidents/${encodeURIComponent(incidentId)}/status`, {
+    method: "PATCH",
+    body: JSON.stringify({ status, resolution_notes }),
+    token,
+  });
+}
+
+export async function generatePIR(jobId, token) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/pir`, {
+    method: "POST",
+    token,
+  });
+}
+
+export async function fetchPIR(jobId, token) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/pir`, { token });
 }
 
 /** POST /api/stream/investigate — SSE chunks + final parse. */

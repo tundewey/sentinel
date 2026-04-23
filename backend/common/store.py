@@ -67,6 +67,12 @@ class Database:
             self._create_follow_ups_table()
             self._ensure_column("remediation_actions", "severity", "TEXT NOT NULL DEFAULT 'medium'")
             self._ensure_column("remediation_actions", "due_date", "TEXT")
+            self._ensure_column("jobs", "pir_json", "TEXT")
+            self._ensure_column("incidents", "resolution_notes", "TEXT")
+            self._ensure_column("remediation_actions", "parent_action_id", "TEXT")
+            self._ensure_column("remediation_actions", "eval_response", "TEXT")
+            self._ensure_column("remediation_actions", "engineer_submission", "TEXT")
+            self._ensure_column("remediation_actions", "source_anchor_action_id", "TEXT")
 
     def _create_remediation_actions_table(self) -> None:
         self._conn.execute(
@@ -387,16 +393,28 @@ class Database:
         actions: list[str],
         action_type: str = "recommended",
         severity: str = "medium",
+        engineer_submission: str | None = None,
+        source_anchor_action_id: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._conn:
             for text in actions:
                 self._conn.execute(
                     """
-                    INSERT INTO remediation_actions (id, job_id, action_text, action_type, status, severity, created_at)
-                    VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                    INSERT INTO remediation_actions
+                      (id, job_id, action_text, action_type, status, severity, created_at, engineer_submission, source_anchor_action_id)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                     """,
-                    (str(uuid.uuid4()), job_id, text, action_type, severity, now),
+                    (
+                        str(uuid.uuid4()),
+                        job_id,
+                        text,
+                        action_type,
+                        severity,
+                        now,
+                        engineer_submission,
+                        source_anchor_action_id,
+                    ),
                 )
 
     def list_remediation_actions(self, job_id: str) -> list[dict]:
@@ -610,6 +628,95 @@ class Database:
             (job_id, action_id),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def list_chat_messages_for_job(self, job_id: str) -> list[dict]:
+        """All remediation chat lines for a job, for audit / workflow export."""
+        rows = self._conn.execute(
+            "SELECT * FROM chat_messages WHERE job_id=? ORDER BY action_id, created_at",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def seed_trail_action(
+        self,
+        job_id: str,
+        action_text: str,
+        severity: str,
+        action_type: str,
+        parent_action_id: str,
+    ) -> str:
+        """Create a child (trail) action linked to a parent action."""
+        action_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO remediation_actions
+                  (id, job_id, action_text, action_type, status, severity, parent_action_id, created_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (action_id, job_id, action_text, action_type, severity, parent_action_id, now),
+            )
+        return action_id
+
+    def save_action_eval_response(self, action_id: str, response: str) -> None:
+        """Persist the LLM evaluation response text on an action."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE remediation_actions SET eval_response=? WHERE id=?",
+                (response, action_id),
+            )
+
+    def get_action(self, action_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM remediation_actions WHERE id=?",
+            (action_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_pir(self, job_id: str, pir_json: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE jobs SET pir_json=? WHERE id=?",
+                (pir_json, job_id),
+            )
+
+    def get_pir(self, job_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT pir_json FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        if not row or not row["pir_json"]:
+            return None
+        try:
+            return json.loads(row["pir_json"])
+        except json.JSONDecodeError:
+            return None
+
+    def update_incident_resolution(
+        self,
+        incident_id: str,
+        status: str,
+        resolution_notes: str | None,
+        clerk_user_id: str | None = None,
+    ) -> bool:
+        resolved_at = datetime.now(timezone.utc).isoformat() if status == "resolved" else None
+        with self._conn:
+            if clerk_user_id:
+                cur = self._conn.execute(
+                    """UPDATE incidents
+                       SET status=?, resolution_notes=?, resolved_at=COALESCE(?, resolved_at)
+                       WHERE id=? AND clerk_user_id=?""",
+                    (status, resolution_notes, resolved_at, incident_id, clerk_user_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    """UPDATE incidents
+                       SET status=?, resolution_notes=?, resolved_at=COALESCE(?, resolved_at)
+                       WHERE id=?""",
+                    (status, resolution_notes, resolved_at, incident_id),
+                )
+        return cur.rowcount > 0
 
     def close(self) -> None:
         self._conn.close()
