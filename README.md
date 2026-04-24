@@ -72,6 +72,7 @@ Deeper reference: [guides/architecture.md](guides/architecture.md), [guides/agen
 - [Tests](#tests)
 - [AWS deployment](#aws-deployment)
 - [Documentation](#documentation)
+- [Squad contributions](#squad-contributions)
 - [Contributing norms](#contributing-norms)
 
 ---
@@ -250,6 +251,8 @@ uv run pytest
 
 There are also package-level tests under services such as `backend/ingest/` and `backend/database/`; running `pytest` from `backend/` discovers the main suite. For ingestion verification specifically, see [backend/ingest/test_ingest.py](backend/ingest/test_ingest.py) and [guides/3_ingestion.md](guides/3_ingestion.md).
 
+Beyond automated suites, **end-to-end validation** means exercising realistic operator workflows against a running stack (for example, submitting an incident, waiting for job completion, and confirming analysis and exports in the UI), complementing faster pytest coverage.
+
 ---
 
 ## AWS deployment
@@ -269,6 +272,18 @@ Infrastructure is organized as **independent Terraform stages** under [terraform
 | [SENTINEL_HANDOVER.md](SENTINEL_HANDOVER.md) | Scaffold / handover status |
 | [guides/agent_architecture.md](guides/agent_architecture.md) | Agent sequence and data flow |
 | [AGENTS.md](AGENTS.md) | Tooling and model conventions for this repo |
+
+---
+
+## Squad contributions
+
+| Name | Role |
+|------|------|
+| Eben and Michael | Backend and frontend: APIs, agent pipeline, and dashboard UI |
+| Joshua | Deployment: AWS, Terraform stages, and end-to-end infrastructure delivery |
+| Tunde | Demo presentation |
+| Ayesha | Base codebase setup, repository documentation, and test engineering: end-to-end scenarios, regression, and smoke coverage from API ingestion through completed jobs in the dashboard |
+| Oluwagbamila | End-to-end application: full product flow from incident intake through analysis to dashboard delivery |
 
 ---
 
