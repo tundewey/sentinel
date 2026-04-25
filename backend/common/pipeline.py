@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import re
 
 from common.config import active_model
 from common.models import IncidentAnalysis, IncidentInput, JobRunResponse
@@ -17,15 +17,59 @@ from summarizer.agent import summarize_incident
 
 logger = logging.getLogger(__name__)
 
-_VALID_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 
+def _build_action_scorecard(
+    *,
+    action_text: str,
+    action_type: str,
+    root_cause_summary: str,
+    root_confidence: str,
+    evidence_pool: list[str],
+) -> dict[str, object]:
+    """Derive trust metadata for one remediation action.
 
-def _integration_notify_severities() -> frozenset[str]:
-    """Comma-separated severities that trigger outbound integrations (default: high,critical)."""
-    raw = os.getenv("INTEGRATION_NOTIFY_SEVERITIES", "high,critical")
-    parts = {p.strip().lower() for p in raw.split(",") if p.strip()}
-    chosen = parts & _VALID_SEVERITIES
-    return frozenset(chosen) if chosen else frozenset({"high", "critical"})
+    This is intentionally heuristic: it gives operators a consistent, evidence-linked
+    confidence signal even when the LLM does not emit per-action confidence fields.
+    """
+    tokens = {t for t in re.findall(r"[a-z0-9]+", action_text.lower()) if len(t) >= 4}
+    matched: list[str] = []
+    for snippet in evidence_pool:
+        s = (snippet or "").strip()
+        if not s:
+            continue
+        s_lower = s.lower()
+        if tokens and any(tok in s_lower for tok in tokens):
+            matched.append(s)
+    if not matched:
+        matched = [s for s in evidence_pool[:2] if (s or "").strip()]
+
+    confidence = (root_confidence or "medium").lower()
+    if action_type in {"check", "followup_check"} and confidence == "high":
+        confidence = "medium"
+    if not matched and confidence == "high":
+        confidence = "medium"
+
+    evidence_count = len(matched)
+    evidence_label = (
+        f"{evidence_count} supporting log snippet"
+        + ("" if evidence_count == 1 else "s")
+        if evidence_count
+        else "no direct supporting log snippets"
+    )
+    rationale = f"This step targets the suspected root cause ({root_cause_summary}) and is backed by {evidence_label}."
+    risk_if_wrong = (
+        "Could delay mitigation and consume responder time without reducing impact."
+        if action_type in {"recommended", "followup", "trail"}
+        else "Could create false confidence that the incident is resolved when it is not."
+    )
+    return {
+        "confidence": (
+            confidence if confidence in {"low", "medium", "high"} else "medium"
+        ),
+        "evidence": matched[:3],
+        "rationale": rationale,
+        "risk_if_wrong": risk_if_wrong,
+    }
 
 
 def run_job(
@@ -130,14 +174,46 @@ def run_job(
 
             for text, sev in zip(remediation.recommended_actions, rec_sevs):
                 sev = sev if sev in valid_severities else incident_severity
+                scorecard = _build_action_scorecard(
+                    action_text=text,
+                    action_type="recommended",
+                    root_cause_summary=root_cause.likely_root_cause,
+                    root_confidence=root_cause.confidence,
+                    evidence_pool=list(
+                        root_cause.supporting_evidence or normalized.evidence_snippets
+                    ),
+                )
                 db.seed_remediation_actions(
-                    job_id, [text], action_type="recommended", severity=sev
+                    job_id,
+                    [text],
+                    action_type="recommended",
+                    severity=sev,
+                    confidence=str(scorecard["confidence"]),
+                    evidence=list(scorecard["evidence"]),
+                    rationale=str(scorecard["rationale"]),
+                    risk_if_wrong=str(scorecard["risk_if_wrong"]),
                 )
 
             for text, sev in zip(remediation.next_checks, chk_sevs):
                 sev = sev if sev in valid_severities else fallback_check_sev
+                scorecard = _build_action_scorecard(
+                    action_text=text,
+                    action_type="check",
+                    root_cause_summary=root_cause.likely_root_cause,
+                    root_confidence=root_cause.confidence,
+                    evidence_pool=list(
+                        root_cause.supporting_evidence or normalized.evidence_snippets
+                    ),
+                )
                 db.seed_remediation_actions(
-                    job_id, [text], action_type="check", severity=sev
+                    job_id,
+                    [text],
+                    action_type="check",
+                    severity=sev,
+                    confidence=str(scorecard["confidence"]),
+                    evidence=list(scorecard["evidence"]),
+                    rationale=str(scorecard["rationale"]),
+                    risk_if_wrong=str(scorecard["risk_if_wrong"]),
                 )
 
         except Exception:  # noqa: BLE001
