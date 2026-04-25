@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from common.config import active_model
 from common.models import IncidentAnalysis, IncidentInput, JobRunResponse
@@ -15,6 +16,16 @@ from remediator.agent import generate_remediation
 from summarizer.agent import summarize_incident
 
 logger = logging.getLogger(__name__)
+
+_VALID_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
+
+
+def _integration_notify_severities() -> frozenset[str]:
+    """Comma-separated severities that trigger outbound integrations (default: high,critical)."""
+    raw = os.getenv("INTEGRATION_NOTIFY_SEVERITIES", "high,critical")
+    parts = {p.strip().lower() for p in raw.split(",") if p.strip()}
+    chosen = parts & _VALID_SEVERITIES
+    return frozenset(chosen) if chosen else frozenset({"high", "critical"})
 
 
 def run_job(
@@ -178,7 +189,7 @@ def _fire_integrations(
     if not integrations:
         return
     severity = analysis.summary.severity
-    if severity not in ("high", "critical"):
+    if severity not in _integration_notify_severities():
         return
     dispatch_all(integrations, analysis)
 

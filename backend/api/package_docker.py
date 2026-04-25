@@ -15,7 +15,16 @@ BACKEND_ROOT = ROOT.parent
 ZIP_PATH = ROOT / "api_lambda.zip"
 DOCKER_IMAGE = "public.ecr.aws/lambda/python:3.12"
 DOCKER_PLATFORM = "linux/amd64"
-SOURCE_DIRS = ["api", "common", "normalizer", "summarizer", "investigator", "remediator", "reports"]
+SOURCE_DIRS = [
+    "api",
+    "common",
+    "integrations",
+    "normalizer",
+    "summarizer",
+    "investigator",
+    "remediator",
+    "reports",
+]
 SKIP_DIRS = {"__pycache__", ".venv"}
 SKIP_SUFFIXES = {".pyc", ".pyo"}
 
