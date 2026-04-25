@@ -13,7 +13,7 @@ from common.models import (
     RemediationPlan,
     RootCauseAnalysis,
 )
-from integrations.dispatcher import dispatch_all
+from integrations.dispatcher import _post_slack, dispatch_all
 
 
 def _sample_analysis() -> IncidentAnalysis:
@@ -79,3 +79,48 @@ def test_dispatch_skips_disabled(mock_client_cls: MagicMock) -> None:
 
 def test_dispatch_empty_list_noop() -> None:
     dispatch_all([], _sample_analysis())
+
+
+@patch("integrations.dispatcher.httpx.Client")
+def test_dispatch_generic_includes_incident_title_and_source(mock_client_cls: MagicMock) -> None:
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client.post = MagicMock(return_value=mock_resp)
+    mock_client_cls.return_value = mock_client
+
+    integrations = [
+        {
+            "type": "generic_webhook",
+            "enabled": True,
+            "config": {"webhook_url": "https://example.com/webhook"},
+        },
+    ]
+    dispatch_all(
+        integrations,
+        _sample_analysis(),
+        incident_title="edge-gateway.txt",
+        incident_source="upload",
+    )
+    body = mock_client.post.call_args[1]["json"]
+    assert body["incident_id"] == "inc-1"
+    assert body["job_id"] == "job-1"
+    assert body["incident_title"] == "edge-gateway.txt"
+    assert body["incident_source"] == "upload"
+    assert list(body.keys())[:6] == [
+        "event",
+        "incident_id",
+        "job_id",
+        "incident_title",
+        "incident_source",
+        "severity",
+    ]
+
+
+def test_slack_rejects_unicode_ellipsis_in_webhook_url() -> None:
+    """Doc-style `…` in the URL path is not a token — Slack returns 302 if posted."""
+    config = {"webhook_url": "https://hooks.slack.com/services/\u2026"}
+    with pytest.raises(ValueError, match="ellipsis"):
+        _post_slack(config, _sample_analysis())

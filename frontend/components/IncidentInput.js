@@ -5,8 +5,19 @@ import { detectContentIssue } from "../lib/contentGuard";
 /** Icons shown beside each issue row. */
 const SEVERITY_ICON = { danger: "🚫", warn: "⚠" };
 
-export default function IncidentInput({ onAnalyze, loading, draft, onDraftChange, onClear, canClear, submitError }) {
+export default function IncidentInput({
+  onAnalyze,
+  onBulkUpload,
+  loading,
+  bulkLoading = false,
+  draft,
+  onDraftChange,
+  onClear,
+  canClear,
+  submitError,
+}) {
   const fileRef = useRef(null);
+  const zipRef = useRef(null);
   const warnRef = useRef(null);
   /**
    * contentWarning shape:
@@ -50,6 +61,16 @@ export default function IncidentInput({ onAnalyze, loading, draft, onDraftChange
 
     onDraftChange({ text: value, source: "upload" });
     event.target.value = "";
+  }
+
+  async function onZipChange(event) {
+    const file = event.target.files?.[0];
+    if (!file || !onBulkUpload) return;
+    try {
+      await onBulkUpload(file);
+    } finally {
+      event.target.value = "";
+    }
   }
 
   function submit(event) {
@@ -133,7 +154,15 @@ export default function IncidentInput({ onAnalyze, loading, draft, onDraftChange
         <textarea
           className="input textarea"
           value={draft.text}
-          onChange={(e) => onDraftChange({ text: e.target.value })}
+          onChange={(e) => {
+            const text = e.target.value;
+            // After ZIP bulk we set source to "upload"; typing/pasting new logs is a manual run.
+            if (draft.source === "upload") {
+              onDraftChange({ text, source: "manual" });
+            } else {
+              onDraftChange({ text });
+            }
+          }}
           placeholder={"2024-04-23T08:12:44Z ERROR database connection refused...\n2024-04-23T08:12:50Z CRITICAL panic: runtime error...\n\nPaste logs, stack trace, and context here..."}
           required
         />
@@ -208,7 +237,23 @@ export default function IncidentInput({ onAnalyze, loading, draft, onDraftChange
         <button
           type="button"
           className="btn btn-muted"
+          onClick={() => zipRef.current?.click()}
+          disabled={bulkLoading || loading}
+        >
+          {bulkLoading ? "Uploading ZIP..." : "Upload ZIP (bulk)"}
+        </button>
+        <input
+          ref={zipRef}
+          type="file"
+          accept=".zip,application/zip"
+          hidden
+          onChange={onZipChange}
+        />
+        <button
+          type="button"
+          className="btn btn-muted"
           onClick={() => fileRef.current?.click()}
+          disabled={bulkLoading}
         >
           Upload .txt or .json
         </button>
@@ -219,7 +264,7 @@ export default function IncidentInput({ onAnalyze, loading, draft, onDraftChange
           hidden
           onChange={onFileChange}
         />
-        <button type="submit" className="btn" disabled={loading || !draft.text.trim() || hasHardBlock}>
+        <button type="submit" className="btn" disabled={loading || bulkLoading || !draft.text.trim() || hasHardBlock}>
           {loading ? "Analyzing..." : showWarning && !hasFormatIssue ? "Analyze anyway?" : "Analyze Incident"}
         </button>
         <button
