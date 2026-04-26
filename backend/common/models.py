@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 Severity = Literal["low", "medium", "high", "critical"]
@@ -40,19 +40,18 @@ class IncidentInput(BaseModel):
             )
         return v
 
-    @model_validator(mode="after")
-    def validate_content_by_source(self) -> IncidentInput:
-        """Reject input that carries no log-format signals, unless source is monitoring."""
+    @field_validator("text", mode="before")
+    @classmethod
+    def must_be_log_format(cls, v: object) -> object:
+        """Reject input that carries no log-format signals."""
         from common.guardrails import validate_log_format  # noqa: PLC0415
 
-        if self.source == "monitoring":
-            # For monitoring, the 'text' field carries a path or identifier, not logs.
-            return self
-
-        valid, reasons = validate_log_format(self.text)
+        if not isinstance(v, str):
+            return v  # let the type system report this error
+        valid, reasons = validate_log_format(v)
         if not valid:
             raise ValueError(" ".join(reasons))
-        return self
+        return v
 
 
 class GuardrailReport(BaseModel):

@@ -6,7 +6,6 @@ const defaultDraft = {
   title: "Production incident",
   source: "manual",
   text: "",
-  path: "",
 };
 
 function readStored() {
