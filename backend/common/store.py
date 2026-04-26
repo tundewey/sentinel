@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS remediation_actions (
   completed_at TEXT,
   notes TEXT,
   severity TEXT NOT NULL DEFAULT 'medium',
+  confidence TEXT NOT NULL DEFAULT 'medium',
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  rationale TEXT,
+  risk_if_wrong TEXT,
   due_date TEXT,
   parent_action_id TEXT,
   eval_response TEXT,
@@ -876,6 +880,10 @@ class _SentinelDb:
         actions: list[str],
         action_type: str = "recommended",
         severity: str = "medium",
+        confidence: str = "medium",
+        evidence: list[str] | None = None,
+        rationale: str | None = None,
+        risk_if_wrong: str | None = None,
         engineer_submission: str | None = None,
         source_anchor_action_id: str | None = None,
     ) -> None:
@@ -885,11 +893,13 @@ class _SentinelDb:
                 """
                 INSERT INTO remediation_actions (
                   id, job_id, action_text, action_type, status,
-                  severity, created_at, engineer_submission, source_anchor_action_id
+                  severity, confidence, evidence_json, rationale, risk_if_wrong,
+                  created_at, engineer_submission, source_anchor_action_id
                 )
                 VALUES (
                   :id, :job_id, :action_text, :action_type, 'pending',
-                  :severity, :created_at, :engineer_submission, :source_anchor_action_id
+                  :severity, :confidence, :evidence_json, :rationale, :risk_if_wrong,
+                  :created_at, :engineer_submission, :source_anchor_action_id
                 )
                 """,
                 {
@@ -898,6 +908,10 @@ class _SentinelDb:
                     "action_text": text,
                     "action_type": action_type,
                     "severity": severity,
+                    "confidence": confidence,
+                    "evidence_json": json.dumps(evidence or []),
+                    "rationale": rationale,
+                    "risk_if_wrong": risk_if_wrong,
                     "created_at": now,
                     "engineer_submission": engineer_submission,
                     "source_anchor_action_id": source_anchor_action_id,
@@ -905,7 +919,7 @@ class _SentinelDb:
             )
 
     def list_remediation_actions(self, job_id: str) -> list[dict]:
-        return self._query(
+        rows = self._query(
             """
             SELECT * FROM remediation_actions
             WHERE job_id=:job_id
@@ -913,6 +927,22 @@ class _SentinelDb:
             """,
             {"job_id": job_id},
         )
+        out: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.pop("evidence_json", "[]")
+            try:
+                parsed = json.loads(raw) if raw else []
+                item["evidence"] = (
+                    [str(x) for x in parsed if isinstance(x, str)]
+                    if isinstance(parsed, list)
+                    else []
+                )
+            except json.JSONDecodeError:
+                item["evidence"] = []
+            item["confidence"] = str(item.get("confidence") or "medium").lower()
+            out.append(item)
+        return out
 
     def update_remediation_action(
         self,
@@ -1171,17 +1201,23 @@ class _SentinelDb:
         severity: str,
         action_type: str,
         parent_action_id: str,
+        confidence: str = "medium",
+        evidence: list[str] | None = None,
+        rationale: str | None = None,
+        risk_if_wrong: str | None = None,
     ) -> str:
         action_id = str(uuid.uuid4())
         self._execute(
             """
             INSERT INTO remediation_actions (
               id, job_id, action_text, action_type, status,
-              severity, parent_action_id, created_at
+              severity, confidence, evidence_json, rationale, risk_if_wrong,
+              parent_action_id, created_at
             )
             VALUES (
               :id, :job_id, :action_text, :action_type, 'pending',
-              :severity, :parent_action_id, :created_at
+              :severity, :confidence, :evidence_json, :rationale, :risk_if_wrong,
+              :parent_action_id, :created_at
             )
             """,
             {
@@ -1190,6 +1226,10 @@ class _SentinelDb:
                 "action_text": action_text,
                 "action_type": action_type,
                 "severity": severity,
+                "confidence": confidence,
+                "evidence_json": json.dumps(evidence or []),
+                "rationale": rationale,
+                "risk_if_wrong": risk_if_wrong,
                 "parent_action_id": parent_action_id,
                 "created_at": self._now_iso(),
             },
@@ -1311,6 +1351,10 @@ class SqliteDatabase(_SentinelDb):
         ("remediation_actions", "engineer_submission", "TEXT"),
         ("remediation_actions", "source_anchor_action_id", "TEXT"),
         ("remediation_actions", "due_date", "TEXT"),
+        ("remediation_actions", "confidence", "TEXT NOT NULL DEFAULT 'medium'"),
+        ("remediation_actions", "evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("remediation_actions", "rationale", "TEXT"),
+        ("remediation_actions", "risk_if_wrong", "TEXT"),
         ("remediation_actions", "notes", "TEXT"),
         ("remediation_actions", "assigned_to", "TEXT"),
         ("remediation_actions", "completed_at", "TEXT"),

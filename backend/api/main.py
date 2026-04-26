@@ -101,7 +101,7 @@ app.add_middleware(
 
 
 def _db() -> Database:
-    return get_database()  # type: ignore[return-value]
+    return get_database()
 
 
 def _job_view(row: dict[str, Any]) -> dict[str, Any]:
@@ -261,6 +261,51 @@ def _clarification_qa_for_export(
             }
         )
     return out
+
+
+def _scorecard_for_action(
+    *,
+    action_text: str,
+    action_type: str,
+    root_cause_summary: str,
+    root_confidence: str,
+    evidence_pool: list[str],
+) -> dict[str, Any]:
+    tokens = {
+        tok
+        for tok in "".join(
+            ch.lower() if ch.isalnum() else " " for ch in action_text
+        ).split()
+        if len(tok) >= 4
+    }
+    matched: list[str] = []
+    for snippet in evidence_pool:
+        s = (snippet or "").strip()
+        if not s:
+            continue
+        lower = s.lower()
+        if tokens and any(tok in lower for tok in tokens):
+            matched.append(s)
+    if not matched:
+        matched = [s for s in evidence_pool[:2] if (s or "").strip()]
+
+    confidence = (root_confidence or "medium").lower()
+    if action_type in {"check", "followup_check"} and confidence == "high":
+        confidence = "medium"
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "medium"
+    rationale = f"This recommendation targets the suspected root cause ({root_cause_summary}) and aligns with observed evidence."
+    risk_if_wrong = (
+        "Could delay mitigation and add unnecessary operational churn."
+        if action_type in {"recommended", "followup", "trail"}
+        else "Could create false confidence that the incident is resolved."
+    )
+    return {
+        "confidence": confidence,
+        "evidence": matched[:3],
+        "rationale": rationale,
+        "risk_if_wrong": risk_if_wrong,
+    }
 
 
 def _build_workflow_export(
@@ -1335,13 +1380,63 @@ def submit_clarifications(
         db.save_clarification_answers(job_id, body.answers)
         db.delete_remediation_actions(job_id)
         if refined.recommended_actions:
-            db.seed_remediation_actions(
-                job_id, refined.recommended_actions, action_type="recommended"
-            )
+            incident_severity = summary.severity
+            valid_severities = {"critical", "high", "medium", "low"}
+            rec_sevs = list(refined.recommended_severities)
+            while len(rec_sevs) < len(refined.recommended_actions):
+                rec_sevs.append(incident_severity)
+            for text, sev in zip(refined.recommended_actions, rec_sevs):
+                sev = sev if sev in valid_severities else incident_severity
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="recommended",
+                    root_cause_summary=root_cause.likely_root_cause,
+                    root_confidence=root_cause.confidence,
+                    evidence_pool=list(
+                        root_cause.supporting_evidence or normalized.evidence_snippets
+                    ),
+                )
+                db.seed_remediation_actions(
+                    job_id,
+                    [text],
+                    action_type="recommended",
+                    severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
+                )
         if refined.next_checks:
-            db.seed_remediation_actions(
-                job_id, refined.next_checks, action_type="check"
-            )
+            fallback_check_sev = {
+                "critical": "high",
+                "high": "medium",
+                "medium": "low",
+                "low": "low",
+            }.get(summary.severity, "medium")
+            chk_sevs = list(refined.check_severities)
+            while len(chk_sevs) < len(refined.next_checks):
+                chk_sevs.append(fallback_check_sev)
+            for text, sev in zip(refined.next_checks, chk_sevs):
+                sev = sev if sev in valid_severities else fallback_check_sev
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="check",
+                    root_cause_summary=root_cause.likely_root_cause,
+                    root_confidence=root_cause.confidence,
+                    evidence_pool=list(
+                        root_cause.supporting_evidence or normalized.evidence_snippets
+                    ),
+                )
+                db.seed_remediation_actions(
+                    job_id,
+                    [text],
+                    action_type="check",
+                    severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
+                )
         db.update_analysis_remediation(job_id, refined.model_dump_json())
 
         return {"refined": True, "remediation": refined.model_dump()}
@@ -1528,12 +1623,23 @@ def evaluate_action_findings(
                 parent_row = db.get_action(cursor_id)
                 cursor_id = parent_row.get("parent_action_id") if parent_row else None
         elif verdict.next_step:
+            scorecard = _scorecard_for_action(
+                action_text=verdict.next_step,
+                action_type=str(action.get("action_type", "recommended")),
+                root_cause_summary=analysis.root_cause.likely_root_cause,
+                root_confidence=analysis.root_cause.confidence,
+                evidence_pool=list(analysis.root_cause.supporting_evidence),
+            )
             child_action_id = db.seed_trail_action(
                 job_id=job_id,
                 action_text=verdict.next_step,
                 severity=action.get("severity", "medium"),
                 action_type=action.get("action_type", "recommended"),
                 parent_action_id=action_id,
+                confidence=scorecard["confidence"],
+                evidence=scorecard["evidence"],
+                rationale=scorecard["rationale"],
+                risk_if_wrong=scorecard["risk_if_wrong"],
             )
 
         return {
@@ -1608,11 +1714,22 @@ def remediation_followup(
                 sevs.append(incident_severity)
             for text, sev in zip(followup.followup_actions, sevs):
                 sev = sev if sev in valid_severities else incident_severity
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="followup",
+                    root_cause_summary=analysis.root_cause.likely_root_cause,
+                    root_confidence=analysis.root_cause.confidence,
+                    evidence_pool=list(analysis.root_cause.supporting_evidence),
+                )
                 db.seed_remediation_actions(
                     job_id,
                     [text],
                     action_type="followup",
                     severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
                     engineer_submission=submission,
                     source_anchor_action_id=anchor,
                 )
@@ -1624,11 +1741,22 @@ def remediation_followup(
                 sevs.append(fallback_check_sev)
             for text, sev in zip(followup.followup_checks, sevs):
                 sev = sev if sev in valid_severities else fallback_check_sev
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="followup_check",
+                    root_cause_summary=analysis.root_cause.likely_root_cause,
+                    root_confidence=analysis.root_cause.confidence,
+                    evidence_pool=list(analysis.root_cause.supporting_evidence),
+                )
                 db.seed_remediation_actions(
                     job_id,
                     [text],
                     action_type="followup_check",
                     severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
                     engineer_submission=submission,
                     source_anchor_action_id=anchor,
                 )
