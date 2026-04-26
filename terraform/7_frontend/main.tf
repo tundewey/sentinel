@@ -149,6 +149,15 @@ resource "aws_iam_role_policy" "api_lambda_aurora_data_api" {
         ]
         Resource = data.terraform_remote_state.database.outputs.aurora_secret_arn
       },
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+          "bedrock:ListFoundationModels",
+        ]
+        Resource = "*"
+      },
     ]
   })
 }

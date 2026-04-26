@@ -420,10 +420,16 @@ export async function streamActionChat(jobId, actionId, message, history, token,
   }
   const enc = encodeURIComponent(jobId);
   const aid = encodeURIComponent(actionId);
+  const sanitizedHistory = (Array.isArray(history) ? history : [])
+    .map((m) => ({
+      role: m?.role,
+      content: typeof m?.content === "string" ? m.content.trim() : "",
+    }))
+    .filter((m) => (m.role === "user" || m.role === "assistant") && m.content.length > 0);
   const res = await fetch(`${BASE_URL}/api/jobs/${enc}/actions/${aid}/chat`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ message, history }),
+    body: JSON.stringify({ message, history: sanitizedHistory }),
   });
   if (!res.ok) {
     const text = await res.text();
