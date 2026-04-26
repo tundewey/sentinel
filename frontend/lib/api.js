@@ -238,6 +238,14 @@ export async function fetchJobs(limit = 25, token) {
   return request(`/api/jobs?limit=${encodeURIComponent(String(limit))}`, { token });
 }
 
+export async function compareJobs(jobIdA, jobIdB, token) {
+  return request("/api/jobs/compare", {
+    method: "POST",
+    body: JSON.stringify({ job_id_a: jobIdA, job_id_b: jobIdB }),
+    token,
+  });
+}
+
 export async function fetchCurrentUser(token) {
   return request("/api/me", { token });
 }
@@ -542,4 +550,17 @@ export async function streamInvestigation(body, token, { onChunk, onDone } = {})
       }
     }
   }
+}
+
+
+export async function fetchReplay(jobId, token) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/replay`, { token });
+}
+
+export async function explainReplayFrame(jobId, frameIndex, token) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/replay/explain`, {
+    method: "POST",
+    body: JSON.stringify({ frame_index: frameIndex }),
+    token,
+  });
 }
