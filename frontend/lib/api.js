@@ -1,8 +1,23 @@
-const RAW_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const BASE_URL = RAW_BASE_URL.replace(/\/+$/, "");
+const CONFIGURED_BASE_URL = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/+$/, "");
+
+function getBaseUrl() {
+  if (CONFIGURED_BASE_URL) {
+    return CONFIGURED_BASE_URL;
+  }
+
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "http://localhost:8000";
+    }
+  }
+
+  throw new Error("Sentinel API URL is not configured for this environment.");
+}
 
 async function request(path, options = {}) {
   const token = options.token;
+  const baseUrl = getBaseUrl();
   const headers = {
     "Content-Type": "application/json",
     ...(options.headers || {}),
@@ -12,7 +27,7 @@ async function request(path, options = {}) {
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await fetch(`${baseUrl}${path}`, {
     ...options,
     headers,
   });
@@ -38,6 +53,18 @@ async function request(path, options = {}) {
         if (parseErr.status === 422) throw parseErr;
       }
     }
+    if (res.status === 401) {
+      try {
+        const json = JSON.parse(text);
+        const d = json.detail;
+        const msg = typeof d === "string" ? d : JSON.stringify(d);
+        const err = new Error(msg || "Unauthorized");
+        err.status = 401;
+        throw err;
+      } catch (parseErr) {
+        if (parseErr.status === 401) throw parseErr;
+      }
+    }
     const err = new Error(text || `Request failed: ${res.status}`);
     err.status = res.status;
     throw err;
@@ -52,6 +79,59 @@ export async function createIncident(payload, token) {
     body: JSON.stringify(payload),
     token,
   });
+}
+
+export async function uploadIncidentsZip(file, options = {}, token) {
+  const source = options.source || "upload";
+  const titlePrefix = (options.titlePrefix || "").trim();
+  const baseUrl = getBaseUrl();
+  const params = new URLSearchParams({ source });
+  if (titlePrefix) params.set("title_prefix", titlePrefix);
+
+  const headers = {};
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const form = new FormData();
+  form.append("archive", file, file.name || "upload.zip");
+
+  const res = await fetch(`${baseUrl}/api/incidents/bulk-zip?${params.toString()}`, {
+    method: "POST",
+    headers,
+    body: form,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    if (res.status === 400) {
+      try {
+        const json = JSON.parse(text);
+        const d = json.detail;
+        if (
+          d
+          && typeof d === "object"
+          && !Array.isArray(d)
+          && d.error === "bulk_zip_validation_failed"
+        ) {
+          const lines = [d.message || "ZIP rejected — no incidents were created."];
+          if (Array.isArray(d.failures)) {
+            for (const f of d.failures) {
+              if (f?.file && f?.reason) lines.push(`${f.file}: ${f.reason}`);
+            }
+          }
+          const err = new Error(lines.join("\n"));
+          err.status = 400;
+          throw err;
+        }
+      } catch (e) {
+        if (e.status === 400) throw e;
+      }
+    }
+    const err = new Error(text || `Request failed: ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
 }
 
 export async function fetchRemediationActions(jobId, token) {
@@ -106,9 +186,10 @@ export async function generateDigest(days, token) {
 }
 
 export async function downloadDigestPdf(days, token) {
+  const baseUrl = getBaseUrl();
   const headers = { Accept: "application/pdf" };
   if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(`${BASE_URL}/api/reports/digest/export?days=${days}`, { headers });
+  const res = await fetch(`${baseUrl}/api/reports/digest/export?days=${days}`, { headers });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Export failed: ${res.status}`);
@@ -139,11 +220,12 @@ export async function fetchJobWorkflow(jobId, token) {
  */
 export async function downloadAuditPdf(jobId, token) {
   const enc = encodeURIComponent(jobId);
+  const baseUrl = getBaseUrl();
   const headers = { Accept: "application/pdf" };
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
-  const res = await fetch(`${BASE_URL}/api/jobs/${enc}/audit/pdf`, { headers });
+  const res = await fetch(`${baseUrl}/api/jobs/${enc}/audit/pdf`, { headers });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Audit PDF export failed: ${res.status}`);
@@ -172,6 +254,14 @@ export async function downloadAuditPdf(jobId, token) {
 
 export async function fetchJobs(limit = 25, token) {
   return request(`/api/jobs?limit=${encodeURIComponent(String(limit))}`, { token });
+}
+
+export async function compareJobs(jobIdA, jobIdB, token) {
+  return request("/api/jobs/compare", {
+    method: "POST",
+    body: JSON.stringify({ job_id_a: jobIdA, job_id_b: jobIdB }),
+    token,
+  });
 }
 
 export async function fetchCurrentUser(token) {
@@ -206,11 +296,12 @@ export async function downloadJobExport(jobId, format, token) {
   const enc = encodeURIComponent(jobId);
   const fmt = format === "pdf" ? "pdf" : "json";
   const accept = fmt === "pdf" ? "application/pdf" : "application/json";
+  const baseUrl = getBaseUrl();
   const headers = { Accept: accept };
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
-  const res = await fetch(`${BASE_URL}/api/jobs/${enc}/export?format=${fmt}`, { headers });
+  const res = await fetch(`${baseUrl}/api/jobs/${enc}/export?format=${fmt}`, { headers });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Export failed: ${res.status}`);
@@ -258,11 +349,12 @@ export async function pollJobUntilDone(jobId, token, { intervalMs = 480, maxWait
  * SSE over fetch (supports Authorization). Invokes onEvent for each message; resolves with final job or null.
  */
 export async function streamJobUntilTerminal(jobId, token, { onEvent } = {}) {
+  const baseUrl = getBaseUrl();
   const headers = {};
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
-  const res = await fetch(`${BASE_URL}/api/jobs/${jobId}/stream`, { headers });
+  const res = await fetch(`${baseUrl}/api/jobs/${jobId}/stream`, { headers });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Stream failed: ${res.status}`);
@@ -317,8 +409,9 @@ export async function createFollowUp(jobId, payload, token) {
 }
 
 export async function deleteFollowUp(jobId, followUpId, token) {
+  const baseUrl = getBaseUrl();
   const res = await fetch(
-    `${BASE_URL}/api/jobs/${encodeURIComponent(jobId)}/follow-ups/${encodeURIComponent(followUpId)}`,
+    `${baseUrl}/api/jobs/${encodeURIComponent(jobId)}/follow-ups/${encodeURIComponent(followUpId)}`,
     {
       method: "DELETE",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -342,16 +435,23 @@ export async function fetchActionChatHistory(jobId, actionId, token) {
  * history: array of { role: "user"|"assistant", content: string }
  */
 export async function streamActionChat(jobId, actionId, message, history, token, { onChunk, onDone } = {}) {
+  const baseUrl = getBaseUrl();
   const headers = { "Content-Type": "application/json" };
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
   const enc = encodeURIComponent(jobId);
   const aid = encodeURIComponent(actionId);
+  const sanitizedHistory = (Array.isArray(history) ? history : [])
+    .map((m) => ({
+      role: m?.role,
+      content: typeof m?.content === "string" ? m.content.trim() : "",
+    }))
+    .filter((m) => (m.role === "user" || m.role === "assistant") && m.content.length > 0);
   const res = await fetch(`${BASE_URL}/api/jobs/${enc}/actions/${aid}/chat`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ message, history }),
+    body: JSON.stringify({ message, history: sanitizedHistory }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -433,11 +533,12 @@ export async function fetchPIR(jobId, token) {
 
 /** POST /api/stream/investigate — SSE chunks + final parse. */
 export async function streamInvestigation(body, token, { onChunk, onDone } = {}) {
+  const baseUrl = getBaseUrl();
   const headers = { "Content-Type": "application/json" };
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
-  const res = await fetch(`${BASE_URL}/api/stream/investigate`, {
+  const res = await fetch(`${baseUrl}/api/stream/investigate`, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
@@ -478,4 +579,17 @@ export async function streamInvestigation(body, token, { onChunk, onDone } = {})
       }
     }
   }
+}
+
+
+export async function fetchReplay(jobId, token) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/replay`, { token });
+}
+
+export async function explainReplayFrame(jobId, frameIndex, token) {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/replay/explain`, {
+    method: "POST",
+    body: JSON.stringify({ frame_index: frameIndex }),
+    token,
+  });
 }

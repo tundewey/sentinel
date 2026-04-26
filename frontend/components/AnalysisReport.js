@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import rehypeSanitize from "rehype-sanitize";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import {
   createFollowUp,
@@ -15,8 +18,71 @@ import { detectChatInjection } from "../lib/contentGuard";
 
 // ── Chat drawer
 
+function MarkdownMessage({ content, isUser }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeSanitize]}
+      components={{
+        p: ({ children }) => <p style={{ margin: "6px 0" }}>{children}</p>,
+        ul: ({ children }) => <ul style={{ margin: "6px 0", paddingLeft: 18 }}>{children}</ul>,
+        ol: ({ children }) => <ol style={{ margin: "6px 0", paddingLeft: 20 }}>{children}</ol>,
+        h1: ({ children }) => <p style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 700 }}>{children}</p>,
+        h2: ({ children }) => <p style={{ margin: "8px 0 4px", fontSize: 13, fontWeight: 700 }}>{children}</p>,
+        h3: ({ children }) => <p style={{ margin: "8px 0 4px", fontSize: 12, fontWeight: 700 }}>{children}</p>,
+        a: ({ href, children }) => (
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--accent)" }}
+          >
+            {children}
+          </a>
+        ),
+        code: ({ inline, children }) => (
+          inline ? (
+            <code
+              style={{
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                fontSize: "0.92em",
+                background: isUser ? "rgba(96,165,250,0.15)" : "rgba(148,163,184,0.2)",
+                borderRadius: 4,
+                padding: "0 4px",
+              }}
+            >
+              {children}
+            </code>
+          ) : (
+            <code>{children}</code>
+          )
+        ),
+        pre: ({ children }) => (
+          <pre
+            style={{
+              margin: "8px 0",
+              padding: "8px 10px",
+              borderRadius: 8,
+              background: isUser ? "rgba(59,130,246,0.16)" : "rgba(15,23,42,0.45)",
+              overflowX: "auto",
+              fontSize: 12,
+              lineHeight: 1.45,
+            }}
+          >
+            {children}
+          </pre>
+        ),
+      }}
+    >
+      {String(content || "")}
+    </ReactMarkdown>
+  );
+}
+
 function ChatMessage({ msg }) {
   const isUser = msg.role === "user";
+  const bubbleBg = isUser ? "rgba(96,165,250,0.12)" : "var(--surface-2)";
+  const bubbleBorder = isUser ? "1px solid rgba(96,165,250,0.35)" : "1px solid var(--border)";
   return (
     <div
       style={{
@@ -28,17 +94,17 @@ function ChatMessage({ msg }) {
       <div
         style={{
           maxWidth: "85%",
-          background: isUser ? "var(--accent)" : "var(--surface-2)",
-          color: isUser ? "#fff" : "var(--text)",
+          background: bubbleBg,
+          border: bubbleBorder,
+          color: "var(--text)",
           borderRadius: isUser ? "12px 12px 2px 12px" : "12px 12px 12px 2px",
           padding: "9px 13px",
           fontSize: 13,
           lineHeight: 1.55,
-          whiteSpace: "pre-wrap",
           wordBreak: "break-word",
         }}
       >
-        {msg.content}
+        <MarkdownMessage content={msg.content} isUser={isUser} />
         {msg.streaming && (
           <span
             style={{
@@ -138,7 +204,7 @@ function ChatDrawer({ action, jobId, getToken, onClose }) {
   function handleSubmit(e) {
     e.preventDefault();
     const text = input.trim();
-    if (!text || streaming) return;
+    if (!text || streaming || injectionWarning) return;
     setInput("");
     sendMessage(text, messages);
   }
@@ -317,7 +383,7 @@ function ChatDrawer({ action, jobId, getToken, onClose }) {
           <button
             type="submit"
             className="btn"
-            disabled={streaming || loadingHistory || !input.trim()}
+            disabled={streaming || loadingHistory || !input.trim() || !!injectionWarning}
             style={{ flexShrink: 0, alignSelf: "flex-end" }}
           >
             {streaming ? "…" : "Send"}
@@ -406,6 +472,124 @@ function SeverityBadge({ severity }) {
       }}
     >
       {meta.label}
+    </span>
+  );
+}
+
+function titleCase(value) {
+  const s = String(value || "").toLowerCase();
+  if (!s) return "Medium";
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function ActionScorecardTooltip({ action, children }) {
+  const confidence = String(action.confidence || "medium").toLowerCase();
+  const confidenceColor =
+    confidence === "high" ? "var(--ok)" : confidence === "low" ? "var(--warn)" : "var(--accent)";
+  const evidence = Array.isArray(action.evidence) ? action.evidence : [];
+  const rationale = action.rationale || "";
+  const risk = action.risk_if_wrong || "";
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    function handleOutsidePointer(event) {
+      if (!rootRef.current?.contains(event.target)) {
+        setOpen(false);
+      }
+    }
+
+    function handleEscape(event) {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handleOutsidePointer);
+    document.addEventListener("touchstart", handleOutsidePointer);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsidePointer);
+      document.removeEventListener("touchstart", handleOutsidePointer);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [open]);
+
+  return (
+    <span
+      ref={rootRef}
+      style={{ position: "relative", display: "block" }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-label="Show recommendation confidence details"
+        style={{
+          background: "none",
+          border: "none",
+          padding: 0,
+          margin: 0,
+          width: "100%",
+          textAlign: "left",
+          cursor: "pointer",
+          color: "inherit",
+          font: "inherit",
+        }}
+      >
+        <span style={{ display: "block" }}>{children}</span>
+      </button>
+      {open ? (
+        <div
+          role="dialog"
+          aria-label="Recommendation confidence and evidence"
+          style={{
+            position: "absolute",
+            left: 0,
+            top: "calc(100% + 6px)",
+            minWidth: 320,
+            maxWidth: 460,
+            zIndex: 30,
+            padding: "10px 12px",
+            borderRadius: 10,
+            background: "var(--surface)",
+            border: "1px solid var(--border-strong)",
+            boxShadow: "0 10px 26px rgba(0,0,0,0.22)",
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Confidence
+            </span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: confidenceColor }}>
+              {titleCase(confidence)}
+            </span>
+            <span style={{ fontSize: 11, color: "var(--muted)" }}>
+              Evidence: {evidence.length}
+            </span>
+          </div>
+          {rationale ? (
+            <p style={{ margin: "6px 0 0", fontSize: 12, lineHeight: 1.45, color: "var(--text)" }}>
+              <strong style={{ color: "var(--muted)" }}>Why:</strong> {rationale}
+            </p>
+          ) : null}
+          {risk ? (
+            <p style={{ margin: "6px 0 0", fontSize: 12, lineHeight: 1.45, color: "var(--text)" }}>
+              <strong style={{ color: "var(--muted)" }}>Risk if wrong:</strong> {risk}
+            </p>
+          ) : null}
+          {evidence.length > 0 ? (
+            <ul style={{ margin: "8px 0 0", paddingLeft: 16, fontSize: 12, lineHeight: 1.45 }}>
+              {evidence.map((item, idx) => (
+                <li key={`${idx}-${item.slice(0, 18)}`}>{item}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
     </span>
   );
 }
@@ -668,17 +852,25 @@ function ActionItem({
           )}
         </button>
 
-        <span
-          style={{
-            flex: 1,
-            fontSize: 13,
-            lineHeight: 1.5,
-            textDecoration: isDone ? "line-through" : "none",
-            color: isDone || isSkipped ? "var(--muted)" : "var(--text)",
-          }}
-        >
-          {action.action_text}
-        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <ActionScorecardTooltip action={action}>
+            <span
+              tabIndex={0}
+              style={{
+                display: "inline",
+                fontSize: 13,
+                lineHeight: 1.5,
+                textDecoration: isDone ? "line-through" : "none",
+                color: isDone || isSkipped ? "var(--muted)" : "var(--text)",
+                cursor: "pointer",
+                borderBottom: "1px dotted rgba(139,155,184,0.45)",
+              }}
+              title="Click to view confidence and evidence"
+            >
+              {action.action_text}
+            </span>
+          </ActionScorecardTooltip>
+        </div>
 
         {/* Severity badge (AI-assigned, read-only) */}
         <SeverityBadge severity={action.severity || "medium"} />
@@ -928,7 +1120,19 @@ function RemediationChecklist({ jobId, getToken, userProfile }) {
   const [followUps, setFollowUps] = useState([]);
 
   useEffect(() => {
-    if (!jobId) return;
+    if (!jobId) {
+      setActions([]);
+      setFollowUps([]);
+      setLoaded(false);
+      setChatAction(null);
+      setRemindAction(null);
+      return;
+    }
+    setActions([]);
+    setFollowUps([]);
+    setLoaded(false);
+    setChatAction(null);
+    setRemindAction(null);
     let cancel = false;
     (async () => {
       try {
@@ -1136,7 +1340,17 @@ function ImmediateChecksCard({ jobId, getToken, userProfile }) {
   const [followUps, setFollowUps] = useState([]);
 
   useEffect(() => {
-    if (!jobId) return;
+    if (!jobId) {
+      setActions([]);
+      setFollowUps([]);
+      setLoaded(false);
+      setRemindAction(null);
+      return;
+    }
+    setActions([]);
+    setFollowUps([]);
+    setLoaded(false);
+    setRemindAction(null);
     let cancel = false;
     (async () => {
       try {

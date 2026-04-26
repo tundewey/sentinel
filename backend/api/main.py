@@ -7,20 +7,25 @@ try:
 except ImportError:  # pragma: no cover - optional for local dev only
     load_dotenv = None
 
+from pathlib import Path
+
 import asyncio
+import io
 import json
 import logging
 import os
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel as _Base
 
 from api.auth import AuthContext, get_user_entitlements, require_auth, require_feature
 from common.liveops import list_live_board_data, refresh_live_board
+from common.guardrails import bulk_zip_hidden_threat_reason, bulk_zip_member_rejection_reason
 from common.log_stats import compute_log_stats
 from common.models import (
     ActionChatRequest,
@@ -39,6 +44,11 @@ from common.models import (
     LiveMonitorConfigUpdate,
     NormalizedIncident,
     RemediationFollowUpRequest,
+    IncidentCompareRequest,
+    IncidentCompareResult,
+    ReplayExplainRequest,
+    ReplayExplainResponse,
+    ReplayResponse,
 )
 from common.audit_pdf import render_audit_classic_pdf
 from common.pdf_report import render_job_pdf
@@ -46,11 +56,24 @@ from common.pipeline import create_incident_and_job, parse_analysis, run_job
 from common.scheduler import ReminderScheduler
 from common.store import Database, get_database
 from investigator.agent import parse_streamed_root_cause, stream_investigation_text
+from comparator.agent import compare_workflows
+from replay.agent import explain_replay_frame
+from replay.builder import build_replay
 
 logger = logging.getLogger(__name__)
 
 if load_dotenv is not None:
-    load_dotenv()
+    # When uvicorn cwd is `backend/`, default load_dotenv() only reads backend/.env.
+    # Prefer repo-root `.env` (same file `scripts/run_local.py` documents).
+    _api_dir = Path(__file__).resolve().parent
+    # Prefer repo-root `.env`, then `backend/.env` (if present).
+    for _base in (_api_dir.parents[2], _api_dir.parents[1]):
+        _env = _base / ".env"
+        if _env.is_file():
+            load_dotenv(_env)
+            break
+    else:
+        load_dotenv()
 
 
 app = FastAPI(title="Sentinel API", version="0.3.0")
@@ -78,7 +101,7 @@ app.add_middleware(
 
 
 def _db() -> Database:
-    return get_database()  # type: ignore[return-value]
+    return get_database()
 
 
 def _job_view(row: dict[str, Any]) -> dict[str, Any]:
@@ -238,6 +261,51 @@ def _clarification_qa_for_export(
             }
         )
     return out
+
+
+def _scorecard_for_action(
+    *,
+    action_text: str,
+    action_type: str,
+    root_cause_summary: str,
+    root_confidence: str,
+    evidence_pool: list[str],
+) -> dict[str, Any]:
+    tokens = {
+        tok
+        for tok in "".join(
+            ch.lower() if ch.isalnum() else " " for ch in action_text
+        ).split()
+        if len(tok) >= 4
+    }
+    matched: list[str] = []
+    for snippet in evidence_pool:
+        s = (snippet or "").strip()
+        if not s:
+            continue
+        lower = s.lower()
+        if tokens and any(tok in lower for tok in tokens):
+            matched.append(s)
+    if not matched:
+        matched = [s for s in evidence_pool[:2] if (s or "").strip()]
+
+    confidence = (root_confidence or "medium").lower()
+    if action_type in {"check", "followup_check"} and confidence == "high":
+        confidence = "medium"
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "medium"
+    rationale = f"This recommendation targets the suspected root cause ({root_cause_summary}) and aligns with observed evidence."
+    risk_if_wrong = (
+        "Could delay mitigation and add unnecessary operational churn."
+        if action_type in {"recommended", "followup", "trail"}
+        else "Could create false confidence that the incident is resolved."
+    )
+    return {
+        "confidence": confidence,
+        "evidence": matched[:3],
+        "rationale": rationale,
+        "risk_if_wrong": risk_if_wrong,
+    }
 
 
 def _build_workflow_export(
@@ -457,6 +525,179 @@ def analyze_sync(
         db.close()
 
 
+def _decode_zip_member(raw: bytes) -> str | None:
+    """Decode zip payload into text; return None for unsupported encodings."""
+    for encoding in ("utf-8", "utf-8-sig", "utf-16", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _zip_entry_is_macos_metadata(norm_path: str, leaf_name: str) -> bool:
+    """True for Finder resource-fork noise — still scanned for threats, never ingested."""
+    return "__MACOSX" in norm_path or leaf_name.startswith("._")
+
+
+# Cap ZIP entry count before reading bodies — avoids huge archives exhausting CPU/memory.
+_BULK_ZIP_MAX_MEMBER_FILES = 400
+
+
+@app.post("/api/incidents/bulk-zip")
+async def create_incidents_bulk_zip(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    source: str = Query(default="upload", max_length=100),
+    title_prefix: str | None = Query(default=None, max_length=120),
+    max_files: int = Query(default=25, ge=1, le=100),
+    user: AuthContext = Depends(require_auth),
+) -> dict[str, Any]:
+    """Create multiple incidents/jobs from a zip archive of text-like files.
+
+    Accepts either:
+    - ``multipart/form-data`` with a file field named ``archive`` (browser / UI), or
+    - Raw body with ``Content-Type: application/zip`` (or octet-stream) for scripts/curl.
+    """
+    ct = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in ct:
+        form = await request.form()
+        up = form.get("archive")
+        if up is None:
+            raise HTTPException(
+                status_code=400,
+                detail='Multipart upload must include a file field named "archive".',
+            )
+        try:
+            zip_bytes = await up.read()
+        except (AttributeError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail='Field "archive" must be a file upload.',
+            ) from exc
+    else:
+        zip_bytes = await request.body()
+    if not zip_bytes:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    allowed_ext = {".txt", ".log", ".json", ".ndjson", ".md", ".csv"}
+    created: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    queued = 0
+    db = _db()
+    try:
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=400, detail="Invalid zip archive.") from exc
+
+        with zf:
+            members = [m for m in zf.infolist() if not m.is_dir()]
+            if not members:
+                raise HTTPException(status_code=400, detail="Zip file contains no files.")
+            if len(members) > _BULK_ZIP_MAX_MEMBER_FILES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"ZIP contains too many entries ({len(members)}). "
+                        f"Maximum {_BULK_ZIP_MAX_MEMBER_FILES} files per archive."
+                    ),
+                )
+
+            # Decode every small text-like member for (1) whole-archive guardrails
+            # including paths we do not ingest (e.g. __MACOSX — must still scan for injection),
+            # then (2) pick ingest candidates.
+            sweep_rows: list[tuple[str, str, str, str, bool]] = []
+            for member in members:
+                norm_path = member.filename.replace("\\", "/")
+                name = norm_path.rsplit("/", 1)[-1]
+                if not name:
+                    skipped.append({"file": member.filename, "reason": "invalid_name"})
+                    continue
+                is_metadata = _zip_entry_is_macos_metadata(norm_path, name)
+                if member.file_size > 500_000:
+                    skipped.append({"file": name, "reason": "file_too_large"})
+                    continue
+                raw = zf.read(member)
+                text = _decode_zip_member(raw)
+                if not text:
+                    skipped.append({"file": name, "reason": "decode_failed"})
+                    continue
+                ext = os.path.splitext(name.lower())[1]
+                sweep_rows.append((norm_path, name, text, ext, is_metadata))
+
+            if not sweep_rows:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Zip contains no readable text files under the size limit.",
+                )
+
+            preflight_failures: list[dict[str, str]] = []
+            for norm_path, name, text, ext, is_metadata in sweep_rows:
+                if is_metadata:
+                    reason = bulk_zip_hidden_threat_reason(text)
+                elif ext in allowed_ext:
+                    reason = bulk_zip_member_rejection_reason(text)
+                else:
+                    reason = bulk_zip_hidden_threat_reason(text)
+                if reason:
+                    preflight_failures.append({"file": norm_path, "reason": reason})
+            if preflight_failures:
+                logger.warning(
+                    "bulk_zip preflight rejected archive: %s",
+                    preflight_failures,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "bulk_zip_validation_failed",
+                        "message": "ZIP rejected — no incidents were created. Fix or remove the listed file(s) and try again.",
+                        "failures": preflight_failures,
+                    },
+                )
+
+            candidates: list[tuple[str, str]] = []
+            for norm_path, name, text, ext, is_metadata in sweep_rows:
+                if is_metadata:
+                    skipped.append({"file": norm_path, "reason": "metadata_file"})
+                    continue
+                if ext not in allowed_ext:
+                    skipped.append({"file": name, "reason": "unsupported_extension"})
+                    continue
+                if len(candidates) >= max_files:
+                    skipped.append({"file": name, "reason": "max_files_reached"})
+                    continue
+                candidates.append((name, text))
+
+            for name, text in candidates:
+                title_base = name[:180]
+                title = (
+                    f"{title_prefix.strip()} - {title_base}"
+                    if title_prefix and title_prefix.strip()
+                    else title_base
+                )
+                payload = IncidentInput(text=text, title=title, source=source)
+                incident_id, job_id = create_incident_and_job(
+                    payload, db, clerk_user_id=user.user_id
+                )
+                background_tasks.add_task(_background_run_job, job_id, user.user_id)
+                created.append({"file": name, "incident_id": incident_id, "job_id": job_id})
+                queued += 1
+
+        if not created:
+            reasons = ", ".join(f"{x['file']}:{x['reason']}" for x in skipped[:5]) or "No supported files found."
+            raise HTTPException(status_code=400, detail=f"No incidents queued. {reasons}")
+
+        return {
+            "queued": len(created),
+            "created": created,
+            "skipped": skipped,
+            "max_files": max_files,
+        }
+    finally:
+        db.close()
+
+
 @app.post("/api/jobs/{job_id}/run")
 def run_analysis(
     job_id: str, user: AuthContext = Depends(require_auth)
@@ -525,6 +766,37 @@ def get_workflow_snapshot(
     finally:
         db.close()
 
+@app.post("/api/jobs/compare", response_model=IncidentCompareResult)
+def post_compare_incidents(
+    body: IncidentCompareRequest,
+    user: AuthContext = Depends(require_auth),
+) -> IncidentCompareResult:
+    """LLM compare of two completed workflow snapshots owned by the caller."""
+    if body.job_id_a == body.job_id_b:
+        raise HTTPException(status_code=422, detail="job_id_a and job_id_b must differ")
+
+    db = _db()
+    try:
+        row_a = db.get_job(body.job_id_a, clerk_user_id=user.user_id)
+        row_b = db.get_job(body.job_id_b, clerk_user_id=user.user_id)
+        if not row_a or not row_b:
+            raise HTTPException(status_code=404, detail="One or both jobs not found")
+        for row, jid in (row_a, body.job_id_a), (row_b, body.job_id_b):
+            st = (row.get("status") or "").lower()
+            if st != "completed":
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Job {jid} is not completed (status={st!r})",
+                )
+        view_a = _enrich_job_view(row_a, db, user.user_id)
+        view_b = _enrich_job_view(row_b, db, user.user_id)
+        wf_a = _build_workflow_export(row_a, view_a, db, body.job_id_a, user.user_id)
+        wf_b = _build_workflow_export(row_b, view_b, db, body.job_id_b, user.user_id)
+        return compare_workflows(
+            body.job_id_a, body.job_id_b, wf_a, wf_b
+        )
+    finally:
+        db.close()
 
 @app.get("/api/jobs/{job_id}/audit/pdf")
 def get_audit_pdf(job_id: str, user: AuthContext = Depends(require_auth)) -> Any:
@@ -617,6 +889,40 @@ async def stream_job_events(
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
 
+@app.get("/api/jobs/{job_id}/replay", response_model=ReplayResponse)
+def get_replay(job_id: str, user: AuthContext = Depends(require_auth)) -> ReplayResponse:
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        view = _enrich_job_view(row, db, user.user_id)
+        workflow = _build_workflow_export(row, view, db, job_id, user.user_id)
+        return build_replay(workflow)
+    finally:
+        db.close()
+
+
+@app.post("/api/jobs/{job_id}/replay/explain", response_model=ReplayExplainResponse)
+def post_replay_explain(
+    job_id: str,
+    body: ReplayExplainRequest,
+    user: AuthContext = Depends(require_auth),
+) -> ReplayExplainResponse:
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        view = _enrich_job_view(row, db, user.user_id)
+        workflow = _build_workflow_export(row, view, db, job_id, user.user_id)
+        replay = build_replay(workflow)
+        if body.frame_index >= len(replay.frames):
+            raise HTTPException(status_code=422, detail="frame_index out of range")
+        frame = replay.frames[body.frame_index].model_dump()
+        return explain_replay_frame(workflow, frame, body.frame_index)
+    finally:
+        db.close()
 
 @app.post("/api/stream/investigate")
 def stream_investigation(
@@ -1074,13 +1380,63 @@ def submit_clarifications(
         db.save_clarification_answers(job_id, body.answers)
         db.delete_remediation_actions(job_id)
         if refined.recommended_actions:
-            db.seed_remediation_actions(
-                job_id, refined.recommended_actions, action_type="recommended"
-            )
+            incident_severity = summary.severity
+            valid_severities = {"critical", "high", "medium", "low"}
+            rec_sevs = list(refined.recommended_severities)
+            while len(rec_sevs) < len(refined.recommended_actions):
+                rec_sevs.append(incident_severity)
+            for text, sev in zip(refined.recommended_actions, rec_sevs):
+                sev = sev if sev in valid_severities else incident_severity
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="recommended",
+                    root_cause_summary=root_cause.likely_root_cause,
+                    root_confidence=root_cause.confidence,
+                    evidence_pool=list(
+                        root_cause.supporting_evidence or normalized.evidence_snippets
+                    ),
+                )
+                db.seed_remediation_actions(
+                    job_id,
+                    [text],
+                    action_type="recommended",
+                    severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
+                )
         if refined.next_checks:
-            db.seed_remediation_actions(
-                job_id, refined.next_checks, action_type="check"
-            )
+            fallback_check_sev = {
+                "critical": "high",
+                "high": "medium",
+                "medium": "low",
+                "low": "low",
+            }.get(summary.severity, "medium")
+            chk_sevs = list(refined.check_severities)
+            while len(chk_sevs) < len(refined.next_checks):
+                chk_sevs.append(fallback_check_sev)
+            for text, sev in zip(refined.next_checks, chk_sevs):
+                sev = sev if sev in valid_severities else fallback_check_sev
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="check",
+                    root_cause_summary=root_cause.likely_root_cause,
+                    root_confidence=root_cause.confidence,
+                    evidence_pool=list(
+                        root_cause.supporting_evidence or normalized.evidence_snippets
+                    ),
+                )
+                db.seed_remediation_actions(
+                    job_id,
+                    [text],
+                    action_type="check",
+                    severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
+                )
         db.update_analysis_remediation(job_id, refined.model_dump_json())
 
         return {"refined": True, "remediation": refined.model_dump()}
@@ -1267,12 +1623,23 @@ def evaluate_action_findings(
                 parent_row = db.get_action(cursor_id)
                 cursor_id = parent_row.get("parent_action_id") if parent_row else None
         elif verdict.next_step:
+            scorecard = _scorecard_for_action(
+                action_text=verdict.next_step,
+                action_type=str(action.get("action_type", "recommended")),
+                root_cause_summary=analysis.root_cause.likely_root_cause,
+                root_confidence=analysis.root_cause.confidence,
+                evidence_pool=list(analysis.root_cause.supporting_evidence),
+            )
             child_action_id = db.seed_trail_action(
                 job_id=job_id,
                 action_text=verdict.next_step,
                 severity=action.get("severity", "medium"),
                 action_type=action.get("action_type", "recommended"),
                 parent_action_id=action_id,
+                confidence=scorecard["confidence"],
+                evidence=scorecard["evidence"],
+                rationale=scorecard["rationale"],
+                risk_if_wrong=scorecard["risk_if_wrong"],
             )
 
         return {
@@ -1347,11 +1714,22 @@ def remediation_followup(
                 sevs.append(incident_severity)
             for text, sev in zip(followup.followup_actions, sevs):
                 sev = sev if sev in valid_severities else incident_severity
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="followup",
+                    root_cause_summary=analysis.root_cause.likely_root_cause,
+                    root_confidence=analysis.root_cause.confidence,
+                    evidence_pool=list(analysis.root_cause.supporting_evidence),
+                )
                 db.seed_remediation_actions(
                     job_id,
                     [text],
                     action_type="followup",
                     severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
                     engineer_submission=submission,
                     source_anchor_action_id=anchor,
                 )
@@ -1363,11 +1741,22 @@ def remediation_followup(
                 sevs.append(fallback_check_sev)
             for text, sev in zip(followup.followup_checks, sevs):
                 sev = sev if sev in valid_severities else fallback_check_sev
+                scorecard = _scorecard_for_action(
+                    action_text=text,
+                    action_type="followup_check",
+                    root_cause_summary=analysis.root_cause.likely_root_cause,
+                    root_confidence=analysis.root_cause.confidence,
+                    evidence_pool=list(analysis.root_cause.supporting_evidence),
+                )
                 db.seed_remediation_actions(
                     job_id,
                     [text],
                     action_type="followup_check",
                     severity=sev,
+                    confidence=scorecard["confidence"],
+                    evidence=scorecard["evidence"],
+                    rationale=scorecard["rationale"],
+                    risk_if_wrong=scorecard["risk_if_wrong"],
                     engineer_submission=submission,
                     source_anchor_action_id=anchor,
                 )

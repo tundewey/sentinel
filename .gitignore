@@ -106,4 +106,11 @@ coverage/
 # Marimo
 marimo/_static/
 marimo/_lsp/
-__marimo__/
+__marimo__/
+
+# Local sample archives and fixtures (stay on your machine only)
+samples/
+
+# Frontend build outputs (repo-root Node section covers root `.next/` / `out/`)
+frontend/.next/
+frontend/out/

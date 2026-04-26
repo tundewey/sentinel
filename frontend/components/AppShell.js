@@ -19,6 +19,8 @@ const nav = [
   },
   { href: "/audit", label: "Audit" },
   { href: "/settings", label: "Settings" },
+  { href: "/compare", label: "Compare" },
+  { href: "/replay", label: "Replay" },
 ];
 
 function UserSection() {
