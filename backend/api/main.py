@@ -44,6 +44,11 @@ from common.models import (
     LiveMonitorConfigUpdate,
     NormalizedIncident,
     RemediationFollowUpRequest,
+    IncidentCompareRequest,
+    IncidentCompareResult,
+    ReplayExplainRequest,
+    ReplayExplainResponse,
+    ReplayResponse,
 )
 from common.audit_pdf import render_audit_classic_pdf
 from common.pdf_report import render_job_pdf
@@ -51,6 +56,9 @@ from common.pipeline import create_incident_and_job, parse_analysis, run_job
 from common.scheduler import ReminderScheduler
 from common.store import Database, get_database
 from investigator.agent import parse_streamed_root_cause, stream_investigation_text
+from comparator.agent import compare_workflows
+from replay.agent import explain_replay_frame
+from replay.builder import build_replay
 
 logger = logging.getLogger(__name__)
 
@@ -713,6 +721,37 @@ def get_workflow_snapshot(
     finally:
         db.close()
 
+@app.post("/api/jobs/compare", response_model=IncidentCompareResult)
+def post_compare_incidents(
+    body: IncidentCompareRequest,
+    user: AuthContext = Depends(require_auth),
+) -> IncidentCompareResult:
+    """LLM compare of two completed workflow snapshots owned by the caller."""
+    if body.job_id_a == body.job_id_b:
+        raise HTTPException(status_code=422, detail="job_id_a and job_id_b must differ")
+
+    db = _db()
+    try:
+        row_a = db.get_job(body.job_id_a, clerk_user_id=user.user_id)
+        row_b = db.get_job(body.job_id_b, clerk_user_id=user.user_id)
+        if not row_a or not row_b:
+            raise HTTPException(status_code=404, detail="One or both jobs not found")
+        for row, jid in (row_a, body.job_id_a), (row_b, body.job_id_b):
+            st = (row.get("status") or "").lower()
+            if st != "completed":
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Job {jid} is not completed (status={st!r})",
+                )
+        view_a = _enrich_job_view(row_a, db, user.user_id)
+        view_b = _enrich_job_view(row_b, db, user.user_id)
+        wf_a = _build_workflow_export(row_a, view_a, db, body.job_id_a, user.user_id)
+        wf_b = _build_workflow_export(row_b, view_b, db, body.job_id_b, user.user_id)
+        return compare_workflows(
+            body.job_id_a, body.job_id_b, wf_a, wf_b
+        )
+    finally:
+        db.close()
 
 @app.get("/api/jobs/{job_id}/audit/pdf")
 def get_audit_pdf(job_id: str, user: AuthContext = Depends(require_auth)) -> Any:
@@ -805,6 +844,40 @@ async def stream_job_events(
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
 
+@app.get("/api/jobs/{job_id}/replay", response_model=ReplayResponse)
+def get_replay(job_id: str, user: AuthContext = Depends(require_auth)) -> ReplayResponse:
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        view = _enrich_job_view(row, db, user.user_id)
+        workflow = _build_workflow_export(row, view, db, job_id, user.user_id)
+        return build_replay(workflow)
+    finally:
+        db.close()
+
+
+@app.post("/api/jobs/{job_id}/replay/explain", response_model=ReplayExplainResponse)
+def post_replay_explain(
+    job_id: str,
+    body: ReplayExplainRequest,
+    user: AuthContext = Depends(require_auth),
+) -> ReplayExplainResponse:
+    db = _db()
+    try:
+        row = db.get_job(job_id, clerk_user_id=user.user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        view = _enrich_job_view(row, db, user.user_id)
+        workflow = _build_workflow_export(row, view, db, job_id, user.user_id)
+        replay = build_replay(workflow)
+        if body.frame_index >= len(replay.frames):
+            raise HTTPException(status_code=422, detail="frame_index out of range")
+        frame = replay.frames[body.frame_index].model_dump()
+        return explain_replay_frame(workflow, frame, body.frame_index)
+    finally:
+        db.close()
 
 @app.post("/api/stream/investigate")
 def stream_investigation(
